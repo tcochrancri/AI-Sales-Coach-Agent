@@ -5,7 +5,6 @@ import { defineConfig } from "vite";
 const apiTarget = process.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
 export default defineConfig({
-  // Allow env files to live one level above the frontend directory
   envDir: path.resolve(__dirname, ".."),
   plugins: [react()],
   server: {
@@ -17,5 +16,12 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  preview: {
+    port: 3000,
+    host: "0.0.0.0",
+    allowedHosts: [
+      "ai-sales-coach-agent-production.up.railway.app"
+    ],
   },
 });
