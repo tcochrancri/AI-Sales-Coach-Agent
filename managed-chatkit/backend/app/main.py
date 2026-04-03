@@ -509,11 +509,11 @@ async def hubspot_context(request: Request) -> JSONResponse:
     if not base_url:
         return respond({"error": "HUBSPOT_MCP_BASE_URL is not configured."}, 500)
 
-    bearer = clean_optional(os.getenv("HUBSPOT_MCP_BEARER"))
-    install_id = clean_optional(os.getenv("HUBSPOT_MCP_INSTALL_ID"))
-    token_id = clean_optional(os.getenv("HUBSPOT_MCP_TOKEN_ID"))
-    access_token = clean_optional(os.getenv("HUBSPOT_MCP_ACCESS_TOKEN"))
-    refresh_token = clean_optional(os.getenv("HUBSPOT_MCP_REFRESH_TOKEN"))
+    bearer = clean_env_secret_single_line(os.getenv("HUBSPOT_MCP_BEARER"))
+    install_id = clean_env_secret_single_line(os.getenv("HUBSPOT_MCP_INSTALL_ID"))
+    token_id = clean_env_secret_single_line(os.getenv("HUBSPOT_MCP_TOKEN_ID"))
+    access_token = clean_env_secret_single_line(os.getenv("HUBSPOT_MCP_ACCESS_TOKEN"))
+    refresh_token = clean_env_secret_single_line(os.getenv("HUBSPOT_MCP_REFRESH_TOKEN"))
     mcp_server_url = clean_optional(os.getenv("HUBSPOT_MCP_SERVER_URL")) or "https://mcp.hubspot.com"
     logger.info(
         "[hubspot:%s] config base_url_set=%s install_id_set=%s token_id_set=%s access_token_set=%s refresh_token_set=%s bearer_set=%s",
@@ -618,8 +618,9 @@ async def hubspot_context(request: Request) -> JSONResponse:
                 refresh_token=refresh_token,
             )
             if refreshed_token or (install_id and refreshed_ok):
-                HUBSPOT_RUNTIME_ACCESS_TOKEN = refreshed_token
-                resolved_access_token = refreshed_token
+                rt = clean_env_secret_single_line(refreshed_token) if refreshed_token else None
+                HUBSPOT_RUNTIME_ACCESS_TOKEN = rt or refreshed_token
+                resolved_access_token = rt or refreshed_token
                 auth_source = "oauth_refresh" if refreshed_token else "install_refresh"
                 request_headers = build_hubspot_request_headers(headers, resolved_access_token)
                 await ensure_hubspot_mcp_connection(
@@ -1292,6 +1293,23 @@ def clean_optional(value: str | None) -> str | None:
     return stripped if stripped else None
 
 
+def clean_env_secret_single_line(value: str | None) -> str | None:
+    """Use only the first line of a secret. Railway / copy-paste often merges two
+    .env lines into one variable (e.g. access token + newline + HUBSPOT_MCP_REFRESH_TOKEN=...),
+    which breaks HTTP headers (Illegal header value)."""
+    if value is None:
+        return None
+    text = value.strip().replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return None
+    first = text.split("\n", 1)[0].strip()
+    if not first:
+        return None
+    if first.lower().startswith("bearer "):
+        first = first[7:].strip()
+    return first if first else None
+
+
 def token_fingerprint(token: str | None) -> str:
     t = clean_optional(token)
     if not t:
@@ -1957,13 +1975,14 @@ def build_hubspot_request_headers(
     base_headers: Mapping[str, str], access_token: str | None
 ) -> dict[str, str]:
     request_headers = dict(base_headers)
-    if not access_token:
+    token = clean_env_secret_single_line(access_token)
+    if not token:
         return request_headers
-    request_headers["Authorization"] = f"Bearer {access_token}"
-    request_headers["X-HubSpot-Access-Token"] = access_token
-    request_headers["x-access-token"] = access_token
-    request_headers["access-token"] = access_token
-    request_headers["access_token"] = access_token
+    request_headers["Authorization"] = f"Bearer {token}"
+    request_headers["X-HubSpot-Access-Token"] = token
+    request_headers["x-access-token"] = token
+    request_headers["access-token"] = token
+    request_headers["access_token"] = token
     return request_headers
 
 
@@ -1977,9 +1996,10 @@ def build_hubspot_base_params(
     if token_id:
         params["tokenId"] = token_id
         params["token_id"] = token_id
-    if access_token:
-        params["accessToken"] = access_token
-        params["access_token"] = access_token
+    token = clean_env_secret_single_line(access_token)
+    if token:
+        params["accessToken"] = token
+        params["access_token"] = token
     return params
 
 
