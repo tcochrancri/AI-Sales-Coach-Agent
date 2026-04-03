@@ -28,5 +28,12 @@ export default defineConfig({
     allowedHosts: [
       "ai-sales-coach-agent-production.up.railway.app"
     ],
+    // Same as dev: without this, relative /api/* from the browser hits preview only.
+    proxy: {
+      "/api": {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+    },
   },
 });

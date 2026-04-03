@@ -1,5 +1,6 @@
 import { FormEvent, MutableRefObject, useEffect, useMemo, useRef, useState } from "react";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { apiUrl } from "../lib/apiBase";
 
 const FORM_STORAGE_KEY = "grant_campaign_tool_form_v1";
 const RESULT_STORAGE_KEY = "grant_campaign_tool_result_v1";
@@ -292,7 +293,7 @@ export function GrantCampaignTool() {
     setResult(null);
     setIsModalOpen(true);
     try {
-      const endpoint = "/api/grant-campaign/generate";
+      const endpoint = apiUrl("/api/grant-campaign/generate");
       console.info("[sled-tool] submitting campaign payload", { endpoint, payload });
       const response = await fetch(endpoint, {
         method: "POST",
@@ -526,7 +527,7 @@ function CampaignResultModal({
     let cancelled = false;
     const checkHealth = async () => {
       try {
-        const response = await fetch("/api/apollo/health");
+        const response = await fetch(apiUrl("/api/apollo/health"));
         const data = (await response.json()) as ApolloHealthResponse;
         if (cancelled) return;
         if (!response.ok || !data.ok) {
@@ -683,7 +684,7 @@ function CampaignResultModal({
     setApolloError(null);
     try {
       const parsed = parseRecipientLabel(recipient.label);
-      const response = await fetch("/api/apollo/enrich-recipients", {
+      const response = await fetch(apiUrl("/api/apollo/enrich-recipients"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -738,7 +739,7 @@ function CampaignResultModal({
     setApolloError(null);
     try {
       const parsed = parseRecipientLabel(recipient.label);
-      const response = await fetch("/api/apollo/enrich-recipients", {
+      const response = await fetch(apiUrl("/api/apollo/enrich-recipients"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -791,7 +792,7 @@ function CampaignResultModal({
     try {
       const orgName = result.minimum_fields_used?.organization_name ?? null;
       const orgWebsite = result.minimum_fields_used?.organization_website ?? null;
-      const apolloSnapshotResp = await fetch("/api/apollo/account-snapshot", {
+      const apolloSnapshotResp = await fetch(apiUrl("/api/apollo/account-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -814,7 +815,7 @@ function CampaignResultModal({
       }
 
       const apolloIndustry = readStringFromRecord(apolloBody.organization, "industry") || null;
-      const hubspotResp = await fetch("/api/hubspot/context", {
+      const hubspotResp = await fetch(apiUrl("/api/hubspot/context"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -846,7 +847,7 @@ function CampaignResultModal({
       const industryHint =
         apolloIndustry ||
         getPrimaryIndustryFromHubspot(hubspotBody);
-      const caseResp = await fetch("/api/case-studies/recommend", {
+      const caseResp = await fetch(apiUrl("/api/case-studies/recommend"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -881,7 +882,7 @@ function CampaignResultModal({
     try {
       const orgName = result.minimum_fields_used?.organization_name ?? null;
       const orgWebsite = result.minimum_fields_used?.organization_website ?? null;
-      const response = await fetch("/api/apollo/account-snapshot", {
+      const response = await fetch(apiUrl("/api/apollo/account-snapshot"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

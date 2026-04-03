@@ -528,7 +528,7 @@ async def hubspot_context(request: Request) -> JSONResponse:
     query = clean_optional(payload.organization_name)
     domain = derive_domain(payload.organization_website)
     if not domain and query:
-        apollo_api_key = clean_optional(os.getenv("APOLLO_API_KEY"))
+        apollo_api_key = clean_env_secret_single_line(os.getenv("APOLLO_API_KEY"))
         if apollo_api_key:
             async with httpx.AsyncClient(base_url="https://api.apollo.io", timeout=15.0) as apollo_client:
                 discovered_domain = await discover_apollo_domain(
@@ -762,7 +762,7 @@ async def hubspot_context(request: Request) -> JSONResponse:
 async def apollo_enrich_recipients(request: Request) -> JSONResponse:
     request_id = str(uuid.uuid4())[:8]
     logger.info("[apollo:%s] enrich request received", request_id)
-    api_key = clean_optional(os.getenv("APOLLO_API_KEY"))
+    api_key = clean_env_secret_single_line(os.getenv("APOLLO_API_KEY"))
     if not api_key:
         return respond({"error": "Missing APOLLO_API_KEY environment variable"}, 500)
     logger.info("[apollo:%s] api key fingerprint=%s", request_id, token_fingerprint(api_key))
@@ -872,7 +872,7 @@ async def apollo_enrich_recipients(request: Request) -> JSONResponse:
 
 @app.get("/api/apollo/health")
 async def apollo_health() -> JSONResponse:
-    api_key = clean_optional(os.getenv("APOLLO_API_KEY"))
+    api_key = clean_env_secret_single_line(os.getenv("APOLLO_API_KEY"))
     has_api_key = bool(api_key)
     if not has_api_key:
         return respond(
@@ -931,7 +931,7 @@ async def apollo_health() -> JSONResponse:
 async def apollo_account_snapshot(request: Request) -> JSONResponse:
     request_id = str(uuid.uuid4())[:8]
     logger.info("[apollo:%s] account snapshot request received", request_id)
-    api_key = clean_optional(os.getenv("APOLLO_API_KEY"))
+    api_key = clean_env_secret_single_line(os.getenv("APOLLO_API_KEY"))
     if not api_key:
         return respond({"error": "Missing APOLLO_API_KEY environment variable"}, 500)
     logger.info("[apollo:%s] api key fingerprint=%s", request_id, token_fingerprint(api_key))
