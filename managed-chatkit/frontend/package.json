@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@openai/chatkit-react": ">=1.1.1 <2.0.0",
+    "pdf-lib": "^1.17.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

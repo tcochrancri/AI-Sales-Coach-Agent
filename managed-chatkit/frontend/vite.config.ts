@@ -7,8 +7,12 @@ const apiTarget = process.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 export default defineConfig({
   envDir: path.resolve(__dirname, ".."),
   plugins: [react()],
+  optimizeDeps: {
+    include: ["pdf-lib"],
+  },
   server: {
-    port: 3000,
+    port: 3001,
+    strictPort: true,
     host: "0.0.0.0",
     proxy: {
       "/api": {
@@ -18,7 +22,8 @@ export default defineConfig({
     },
   },
   preview: {
-    port: 3000,
+    port: 3001,
+    strictPort: true,
     host: "0.0.0.0",
     allowedHosts: [
       "ai-sales-coach-agent-production.up.railway.app"

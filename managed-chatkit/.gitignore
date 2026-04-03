@@ -23,6 +23,7 @@ dist/
 # misc
 .DS_Store
 *.pem
+.npm-cache/
 
 # debug
 npm-debug.log*
