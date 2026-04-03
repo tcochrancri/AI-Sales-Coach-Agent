@@ -575,9 +575,9 @@ async def hubspot_context(request: Request) -> JSONResponse:
                 {
                     "error": "Missing HubSpot auth context for MCP calls.",
                     "details": [
-                        "Set HUBSPOT_MCP_INSTALL_ID for durable server-managed token refresh (recommended), or",
-                        "Set HUBSPOT_MCP_ACCESS_TOKEN in managed-chatkit/.env.local, or",
-                        "Set HUBSPOT_MCP_TOKEN_ID and ensure /oauth/token/:tokenId returns an access_token.",
+                        "Set HUBSPOT_MCP_INSTALL_ID on the server (Railway env vars) for durable token refresh (recommended), or",
+                        "Set HUBSPOT_MCP_ACCESS_TOKEN (expires; rotate when HubSpot invalidates it), or",
+                        "Set HUBSPOT_MCP_TOKEN_ID and ensure HUBSPOT_MCP_BASE_URL serves GET /oauth/token/:tokenId with access_token.",
                     ],
                 },
                 400,
