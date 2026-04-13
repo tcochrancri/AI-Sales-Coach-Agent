@@ -9,15 +9,16 @@ import re
 import time
 import uuid
 import ipaddress
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal, Mapping
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 DEFAULT_CHATKIT_BASE = "https://api.openai.com"
@@ -47,6 +48,7 @@ MODEL_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "gpt-4.1-nano": {"input": 0.1, "output": 0.4},
 }
 WEB_SEARCH_PREVIEW_COST_PER_CALL_USD = 0.025
+DEFAULT_SHAREPOINT_MATCH_FILE_EXTENSIONS = ["pptx", "ppt"]
 
 app = FastAPI(title="Managed ChatKit Session API")
 
@@ -339,7 +341,36 @@ class CaseStudyRecommendRequest(BaseModel):
 
     organization_name: str | None = None
     industry_vertical: str | None = None
+    project_description: str | None = None
     max_items: int = Field(default=3, ge=1, le=10)
+
+
+class AssetPackageItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    title: str | None = None
+    url: str | None = None
+    path: str | None = None
+    score: float | None = None
+
+
+class AssetPreparePackageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    organization_name: str | None = None
+    assets: list[AssetPackageItem] = Field(default_factory=list, min_length=1, max_length=10)
+
+
+class ApolloAttachEmailStepAssetsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sequence_id: str = Field(min_length=1)
+    email_step_number: int = Field(default=1, ge=1, le=10)
+    organization_name: str | None = None
+    max_total_bytes: int = Field(default=150_000_000, ge=1_000_000, le=250_000_000)
+    max_zip_bytes: int = Field(default=75_000_000, ge=1_000_000, le=100_000_000)
+    assets: list[AssetPackageItem] = Field(default_factory=list, min_length=1, max_length=10)
 
 
 @app.post("/api/grant-campaign/generate")
@@ -924,7 +955,95 @@ async def apollo_health() -> JSONResponse:
             "message": None if upstream_ok else (upstream_error or "Apollo auth health check failed."),
         },
         200,
+        )
+
+
+@app.get("/api/apollo/sequences")
+async def apollo_sequences(request: Request) -> JSONResponse:
+    limit_raw = request.query_params.get("limit")
+    query = clean_optional(request.query_params.get("q"))
+    active_raw = (request.query_params.get("active") or "").strip().lower()
+    active_only = active_raw in {"1", "true", "yes", "y", "on"}
+    try:
+        limit = max(1, min(100, int(limit_raw or "50")))
+    except ValueError:
+        limit = 50
+
+    tool_args: dict[str, Any] = {"max_results": limit}
+    if query:
+        tool_args["query"] = query
+    result, error = await call_cri_mcp_tool(
+        "apollo_listSequences",
+        tool_args,
     )
+    if error:
+        return respond({"error": error}, 502)
+    sequences_raw = result.get("sequences") if isinstance(result, Mapping) else None
+    sequences = sequences_raw if isinstance(sequences_raw, list) else []
+    if active_only:
+        filtered: list[Any] = []
+        for row in sequences:
+            if not isinstance(row, Mapping):
+                continue
+            status_value = clean_optional(str(row.get("status") or "")) or ""
+            status_key = status_value.strip().lower()
+            if status_key in {"active", "running", "enabled", "in_progress"}:
+                filtered.append(row)
+        sequences = filtered
+    return respond({"sequences": sequences, "count": len(sequences)}, 200)
+
+
+@app.post("/api/apollo/attach-email-step-assets")
+async def apollo_attach_email_step_assets(request: Request) -> JSONResponse:
+    request_id = str(uuid.uuid4())[:8]
+    body = await read_json_body(request)
+    try:
+        payload = ApolloAttachEmailStepAssetsRequest.model_validate(body)
+    except ValidationError as error:
+        logger.warning("[apollo-attach:%s] invalid payload details=%s", request_id, error.errors())
+        return respond({"error": "Invalid request payload", "details": error.errors()}, 400)
+
+    selected_files: list[dict[str, Any]] = []
+    for asset in payload.assets:
+        item: dict[str, Any] = {}
+        if clean_optional(asset.id):
+            item["id"] = clean_optional(asset.id)
+        if clean_optional(asset.url):
+            item["web_url"] = clean_optional(asset.url)
+        if clean_optional(asset.title):
+            item["name"] = clean_optional(asset.title)
+        if item:
+            selected_files.append(item)
+
+    if not selected_files:
+        logger.warning("[apollo-attach:%s] no valid assets after normalization", request_id)
+        return respond({"error": "No valid assets selected for attachment."}, 400)
+
+    result, error = await call_cri_mcp_tool(
+        "apollo_attachAssetsToEmailStep",
+        {
+            "sequence_id": payload.sequence_id,
+            "email_step_number": payload.email_step_number,
+            "organization_name": payload.organization_name,
+            "max_total_bytes": payload.max_total_bytes,
+            "max_zip_bytes": payload.max_zip_bytes,
+            "selected_files": selected_files,
+        },
+    )
+    if error:
+        logger.error("[apollo-attach:%s] mcp tool error=%s", request_id, error)
+        return respond({"error": error}, 502)
+    if isinstance(result, Mapping) and result.get("success") is False:
+        message = clean_optional(str(result.get("message") or "")) or "Apollo attach tool returned unsuccessful result."
+        logger.warning(
+            "[apollo-attach:%s] mcp returned unsuccessful result message=%s keys=%s",
+            request_id,
+            message,
+            sorted(result.keys()),
+        )
+        return respond({"error": message, "result": result}, 400)
+    logger.info("[apollo-attach:%s] success sequence_id=%s step=%s files=%s", request_id, payload.sequence_id, payload.email_step_number, len(selected_files))
+    return respond({"success": True, "result": result}, 200)
 
 
 @app.post("/api/apollo/account-snapshot")
@@ -1109,12 +1228,34 @@ async def case_study_recommendations(request: Request) -> JSONResponse:
 
     org_name = normalize_text(payload.organization_name)
     vertical = normalize_text(payload.industry_vertical)
+
+    sharepoint_items, sharepoint_meta = await fetch_sharepoint_recommended_assets(payload)
+    if sharepoint_items:
+        return respond(
+            {
+                "items": sharepoint_items[: payload.max_items],
+                "source": "sharepoint_mcp",
+                "filters": {
+                    "industry_vertical": vertical or None,
+                    "organization_name": payload.organization_name,
+                    "project_description": clean_optional(payload.project_description),
+                    "max_items": payload.max_items,
+                },
+                "sharepoint": sharepoint_meta,
+            },
+            200,
+        )
+
     library = parse_case_study_library()
     if not library:
         return respond(
             {
                 "items": [],
-                "message": "No case study library configured. Set CASE_STUDY_LIBRARY_JSON on backend.",
+                "message": (
+                    "No SharePoint matches returned and no CASE_STUDY_LIBRARY_JSON fallback configured."
+                ),
+                "source": "none",
+                "sharepoint": sharepoint_meta,
             },
             200,
         )
@@ -1138,14 +1279,175 @@ async def case_study_recommendations(request: Request) -> JSONResponse:
     return respond(
         {
             "items": top,
+            "source": "env_case_study_library",
             "filters": {
                 "industry_vertical": vertical or None,
                 "organization_name": payload.organization_name,
+                "project_description": clean_optional(payload.project_description),
                 "max_items": payload.max_items,
             },
+            "sharepoint": sharepoint_meta,
         },
         200,
     )
+
+
+@app.post("/api/assets/prepare-package")
+async def prepare_asset_package(request: Request) -> Response:
+    body = await read_json_body(request)
+    try:
+        payload = AssetPreparePackageRequest.model_validate(body)
+    except ValidationError as error:
+        return respond({"error": "Invalid request payload", "details": error.errors()}, 400)
+
+    base_url, bearer = resolve_sharepoint_mcp_connection()
+    if not base_url:
+        return respond(
+            {"error": "Missing SharePoint MCP base URL. Set SHAREPOINT_MCP_BASE_URL or CRI_MCP_BASE_URL."},
+            500,
+        )
+    if not bearer:
+        return respond(
+            {"error": "Missing SharePoint MCP bearer token. Set SHAREPOINT_MCP_BEARER or CRI_MCP_BEARER."},
+            500,
+        )
+
+    package_assets = []
+    for asset in payload.assets:
+        package_assets.append(
+            {
+                "id": clean_optional(asset.id),
+                "title": clean_optional(asset.title),
+                "url": clean_optional(asset.url),
+                "path": clean_optional(asset.path),
+                "score": float(asset.score) if asset.score is not None else None,
+            }
+        )
+
+    mcp_request_body = {
+        "organization_name": clean_optional(payload.organization_name),
+        "assets": package_assets,
+        "output_format": "zip",
+    }
+    package_tool_name = clean_optional(os.getenv("SHAREPOINT_PREPARE_PACKAGE_TOOL")) or "sharepoint_prepareAttachmentPackage"
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "x-api-key": bearer,
+    }
+
+    try:
+        async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=90.0) as client:
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "id": f"asset-package-{uuid.uuid4().hex[:8]}",
+                "method": "tools/call",
+                "params": {
+                    "name": package_tool_name,
+                    "arguments": mcp_request_body,
+                },
+            }
+            rpc_response, rpc_error = await fetch_external_json(
+                client=client,
+                method="POST",
+                path="/mcp",
+                headers=headers,
+                json_body=rpc_payload,
+            )
+    except httpx.RequestError as error:
+        return respond({"error": f"Failed to reach MCP server: {error}"}, 502)
+
+    if rpc_error or not isinstance(rpc_response, Mapping):
+        return respond(
+            {
+                "error": "Asset package tool call failed.",
+                "details": [rpc_error or "Invalid MCP response"],
+            },
+            502,
+        )
+
+    extracted = extract_tool_payload_from_mcp_response(rpc_response)
+    if not isinstance(extracted, Mapping):
+        return respond({"error": "Invalid package payload returned from MCP."}, 502)
+
+    zip_base64 = first_non_empty_string(
+        extracted,
+        [
+            "zip_base64",
+            "package_base64",
+            "content_base64",
+            "data_base64",
+            "base64",
+        ],
+    )
+    if not zip_base64:
+        return respond(
+            {
+                "error": "MCP package response did not include zip content.",
+                "details": [str(extracted)[:500]],
+            },
+            502,
+        )
+
+    try:
+        zip_bytes = base64.b64decode(zip_base64, validate=False)
+    except (ValueError, TypeError):
+        return respond({"error": "Invalid base64 zip content returned from MCP."}, 502)
+    if not zip_bytes:
+        return respond({"error": "Decoded zip package was empty."}, 502)
+
+    raw_filename = first_non_empty_string(
+        extracted,
+        ["filename", "file_name", "package_name", "zip_name"],
+    )
+    fallback_name = f"{slugify(clean_optional(payload.organization_name) or 'sales-coach-assets')}.zip"
+    filename = ensure_zip_filename(raw_filename or fallback_name)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/assets/thumbnail")
+async def get_asset_thumbnail(request: Request) -> Response:
+    source_url = clean_optional(request.query_params.get("url"))
+    if not source_url:
+        return respond({"error": "Missing required query parameter: url"}, 400)
+    if "sharepoint.com" not in source_url.lower():
+        return respond({"error": "Only SharePoint URLs are supported for thumbnail proxy."}, 400)
+
+    candidates = build_sharepoint_preview_candidates(source_url)
+    if not candidates:
+        return respond({"error": "Unable to derive SharePoint preview URL."}, 400)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for candidate in candidates:
+                preview_resp = await client.get(
+                    candidate,
+                    headers={
+                        "Accept": "image/*,*/*;q=0.8",
+                        "User-Agent": "AI-Sales-Coach/1.0",
+                    },
+                )
+                content_type = (preview_resp.headers.get("content-type") or "").lower()
+                if preview_resp.is_success and content_type.startswith("image/") and preview_resp.content:
+                    return Response(
+                        content=preview_resp.content,
+                        media_type=content_type.split(";")[0],
+                        headers={"Cache-Control": "private, max-age=900"},
+                    )
+                logger.info(
+                    "[thumbnail] preview fetch non-image status=%s content_type=%s candidate=%s",
+                    preview_resp.status_code,
+                    content_type or "unknown",
+                    candidate,
+                )
+    except httpx.RequestError as error:
+        logger.warning("[thumbnail] request failed: %s", error)
+        return respond({"error": f"Thumbnail proxy request failed: {error}"}, 502)
+
+    return respond({"error": "Preview unavailable for this asset URL."}, 404)
 
 
 def respond(
@@ -1293,6 +1595,29 @@ def clean_optional(value: str | None) -> str | None:
     return stripped if stripped else None
 
 
+def first_non_empty_string(payload: Mapping[str, Any], keys: list[str]) -> str | None:
+    for key in keys:
+        value = clean_optional(str(payload.get(key) or ""))
+        if value:
+            return value
+    return None
+
+
+def slugify(value: str) -> str:
+    base = normalize_text(value) or "assets"
+    base = re.sub(r"[^a-z0-9]+", "-", base)
+    base = base.strip("-")
+    return base or "assets"
+
+
+def ensure_zip_filename(value: str) -> str:
+    cleaned = clean_optional(value) or "assets.zip"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", cleaned)
+    if not safe.lower().endswith(".zip"):
+        safe = f"{safe}.zip"
+    return safe
+
+
 def clean_env_secret_single_line(value: str | None) -> str | None:
     """Use only the first line of a secret. Railway / copy-paste often merges two
     .env lines into one variable (e.g. access token + newline + HUBSPOT_MCP_REFRESH_TOKEN=...),
@@ -1308,6 +1633,30 @@ def clean_env_secret_single_line(value: str | None) -> str | None:
     if first.lower().startswith("bearer "):
         first = first[7:].strip()
     return first if first else None
+
+
+def local_env_value(key: str) -> str | None:
+    """Dev-only fallback for local runs when process env does not carry expected
+    keys. Reads managed-chatkit/.env.local directly."""
+    if is_prod():
+        return None
+    backend_dir = os.path.dirname(os.path.dirname(__file__))  # managed-chatkit/backend
+    env_path = os.path.join(backend_dir, "..", ".env.local")
+    if not os.path.exists(env_path):
+        return None
+    try:
+        with open(env_path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() != key:
+                    continue
+                return clean_env_secret_single_line(v.strip().strip("'\""))
+    except OSError:
+        return None
+    return None
 
 
 def token_fingerprint(token: str | None) -> str:
@@ -1969,6 +2318,381 @@ def parse_case_study_library() -> list[dict[str, Any]]:
             }
         )
     return output
+
+
+def resolve_sharepoint_mcp_connection() -> tuple[str | None, str | None]:
+    base_url = clean_optional(os.getenv("SHAREPOINT_MCP_BASE_URL")) or clean_optional(
+        os.getenv("CRI_MCP_BASE_URL")
+    )
+    if not base_url:
+        base_url = clean_optional(local_env_value("SHAREPOINT_MCP_BASE_URL")) or clean_optional(
+            local_env_value("CRI_MCP_BASE_URL")
+        )
+    bearer = clean_env_secret_single_line(os.getenv("SHAREPOINT_MCP_BEARER")) or clean_env_secret_single_line(
+        os.getenv("CRI_MCP_BEARER")
+    )
+    if not bearer:
+        bearer = clean_env_secret_single_line(local_env_value("SHAREPOINT_MCP_BEARER")) or clean_env_secret_single_line(
+            local_env_value("CRI_MCP_BEARER")
+        )
+    return base_url, bearer
+
+
+async def call_cri_mcp_tool(tool_name: str, arguments: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None, str | None]:
+    base_url, bearer = resolve_sharepoint_mcp_connection()
+    if not base_url:
+        return None, "Missing SHAREPOINT_MCP_BASE_URL / CRI_MCP_BASE_URL for MCP tool call."
+    if not bearer:
+        return None, "Missing SHAREPOINT_MCP_BEARER / CRI_MCP_BEARER for MCP tool call."
+
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "x-api-key": bearer,
+    }
+
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": f"tool-{uuid.uuid4().hex[:8]}",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": dict(arguments)},
+    }
+    try:
+        async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=60.0) as client:
+            rpc_response, rpc_error = await fetch_external_json(
+                client=client,
+                method="POST",
+                path="/mcp",
+                headers=headers,
+                json_body=rpc_payload,
+            )
+    except httpx.RequestError as error:
+        return None, f"MCP request failed: {error}"
+
+    if rpc_error or not isinstance(rpc_response, Mapping):
+        return None, rpc_error or "Invalid MCP response payload."
+
+    mcp_error = rpc_response.get("error")
+    if isinstance(mcp_error, Mapping):
+        error_message = clean_optional(str(mcp_error.get("message") or "")) or "unknown_mcp_error"
+        error_code = mcp_error.get("code")
+        if error_code is not None:
+            return None, f"MCP tool call failed ({error_code}): {error_message}"
+        return None, f"MCP tool call failed: {error_message}"
+    if mcp_error:
+        return None, f"MCP tool call failed: {mcp_error}"
+
+    extracted = extract_tool_payload_from_mcp_response(rpc_response)
+    if not isinstance(extracted, Mapping):
+        return None, "Tool response could not be parsed from MCP response."
+    return extracted, None
+
+
+async def fetch_sharepoint_recommended_assets(
+    payload: CaseStudyRecommendRequest,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    base_url, bearer = resolve_sharepoint_mcp_connection()
+    if not base_url:
+        return [], {
+            "enabled": False,
+            "reason": "Neither SHAREPOINT_MCP_BASE_URL nor CRI_MCP_BASE_URL is configured",
+        }
+    bearer_present = bool(bearer)
+    bearer_fp = token_fingerprint(bearer)
+    share_url = clean_optional(os.getenv("SHAREPOINT_MATCH_SHARE_URL"))
+    ext_csv = clean_optional(os.getenv("SHAREPOINT_MATCH_FILE_EXTENSIONS"))
+    extensions = parse_extensions_csv(ext_csv) or DEFAULT_SHAREPOINT_MATCH_FILE_EXTENSIONS
+
+    project_description = build_sharepoint_project_description(payload)
+    vertical_hint = infer_vertical_hint(payload.industry_vertical, project_description)
+
+    request_body: dict[str, Any] = {
+        "project_description": project_description,
+        "file_extensions": extensions,
+        "max_results": max(payload.max_items, 3),
+    }
+    if share_url:
+        request_body["share_url"] = share_url
+    if vertical_hint:
+        request_body["vertical_hint"] = vertical_hint
+
+    headers: dict[str, str] = {}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+        headers["x-api-key"] = bearer
+
+    output_status_code = 0
+    try:
+        async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0) as client:
+            tool_payload: Mapping[str, Any] | None = None
+            protocol_used = "mcp_jsonrpc"
+            rest_error_message: str | None = None
+
+            # Prefer MCP JSON-RPC first for CRI server to avoid noisy /tools 404s.
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "id": f"sharepoint-{uuid.uuid4().hex[:8]}",
+                "method": "tools/call",
+                "params": {"name": "sharepoint_matchBidFiles", "arguments": request_body},
+            }
+            rpc_response, rpc_error = await fetch_external_json(
+                client=client,
+                method="POST",
+                path="/mcp",
+                headers=headers,
+                json_body=rpc_payload,
+            )
+            if not rpc_error and isinstance(rpc_response, Mapping):
+                extracted = extract_tool_payload_from_mcp_response(rpc_response)
+                if isinstance(extracted, Mapping):
+                    tool_payload = extracted
+                    output_status_code = 200
+                else:
+                    rest_error_message = "MCP /mcp call succeeded but returned unparseable tool payload"
+            else:
+                rest_error_message = rpc_error or "invalid /mcp response"
+
+            # Fallback for non-MCP deployments that only expose /tools/<name>.
+            if tool_payload is None:
+                protocol_used = "rest_tools"
+                response = await client.post("/tools/sharepoint_matchBidFiles", headers=headers, json=request_body)
+                output_status_code = response.status_code
+                raw_payload = parse_json(response)
+                if response.is_success:
+                    root_payload: Mapping[str, Any] = raw_payload if isinstance(raw_payload, Mapping) else {}
+                    result_payload = root_payload.get("result")
+                    tool_payload = result_payload if isinstance(result_payload, Mapping) else root_payload
+                if not isinstance(tool_payload, Mapping):
+                    return [], {
+                        "enabled": True,
+                        "status_code": output_status_code,
+                        "error": summarize_external_error(raw_payload) or "sharepoint tool payload missing or invalid",
+                        "mcp_error": rest_error_message,
+                        "bearer_present": bearer_present,
+                        "bearer_fingerprint": bearer_fp,
+                    }
+    except httpx.RequestError as error:
+        return [], {
+            "enabled": True,
+            "error": f"request_failed: {error}",
+            "bearer_present": bearer_present,
+            "bearer_fingerprint": bearer_fp,
+        }
+
+    if not isinstance(tool_payload, Mapping):
+        return [], {
+            "enabled": True,
+            "error": "sharepoint tool payload missing or invalid",
+            "bearer_present": bearer_present,
+            "bearer_fingerprint": bearer_fp,
+        }
+
+    matches = tool_payload.get("matches")
+    if not isinstance(matches, list):
+        return [], {
+            "enabled": True,
+            "error": "sharepoint_matchBidFiles returned no matches array",
+            "bearer_present": bearer_present,
+            "bearer_fingerprint": bearer_fp,
+        }
+
+    items: list[dict[str, Any]] = []
+    for row in matches:
+        if not isinstance(row, Mapping):
+            continue
+        url = clean_optional(str(row.get("web_url") or ""))
+        if not url:
+            continue
+        ext = normalize_text(clean_optional(str(row.get("extension") or "")))
+        if ext and ext not in {"pptx", "ppt"}:
+            continue
+        title = clean_optional(str(row.get("name") or "")) or "Recommended asset"
+        score = row.get("score")
+        reason = clean_optional(str(row.get("reason") or ""))
+        path = clean_optional(str(row.get("path") or ""))
+        matched_terms = row.get("matched_terms")
+        last_modified = clean_optional(str(row.get("last_modified") or ""))
+        item_id = clean_optional(str(row.get("id") or ""))
+        thumbnail_url = clean_optional(
+            str(
+                row.get("thumbnail_url")
+                or row.get("preview_url")
+                or ""
+            )
+        )
+        thumbnail_base64 = clean_optional(
+            str(
+                row.get("thumbnail_base64")
+                or row.get("preview_base64")
+                or ""
+            )
+        )
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "url": url,
+                "thumbnail_url": thumbnail_url,
+                "thumbnail_base64": thumbnail_base64,
+                "industry": clean_optional(payload.industry_vertical),
+                "score": score if isinstance(score, (int, float)) else None,
+                "reason": reason,
+                "path": path,
+                "matched_terms": matched_terms if isinstance(matched_terms, list) else [],
+                "last_modified": last_modified,
+                "source": "sharepoint_mcp",
+            }
+        )
+
+    items.sort(key=sharepoint_asset_sort_key, reverse=True)
+    deduped = dedupe_assets_by_url(items)
+    return deduped[: payload.max_items], {
+        "enabled": True,
+        "status_code": output_status_code,
+        "protocol": protocol_used,
+        "bearer_present": bearer_present,
+        "bearer_fingerprint": bearer_fp,
+        "inferred_vertical": clean_optional(str(tool_payload.get("inferred_vertical") or "")),
+        "scanned_file_count": tool_payload.get("scanned_file_count"),
+        "matched_file_count": tool_payload.get("matched_file_count"),
+    }
+
+
+def build_sharepoint_project_description(payload: CaseStudyRecommendRequest) -> str:
+    direct = clean_optional(payload.project_description)
+    if direct:
+        return direct
+    parts = [
+        clean_optional(payload.organization_name),
+        clean_optional(payload.industry_vertical),
+        "bid response presentation and customer story alignment for enterprise consulting services",
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def parse_extensions_csv(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [
+        token.strip().lower().lstrip(".")
+        for token in raw.split(",")
+        if token.strip()
+    ]
+
+
+def build_sharepoint_preview_candidates(source_url: str) -> list[str]:
+    try:
+        parsed = urlparse(source_url)
+    except ValueError:
+        return []
+    if not parsed.scheme or not parsed.netloc:
+        return []
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    encoded = quote(source_url, safe="")
+    return [
+        f"{origin}/_layouts/15/getpreview.ashx?path={encoded}&resolution=2",
+        f"{origin}/_layouts/15/getpreview.ashx?path={encoded}&resolution=3&cropMode=1",
+    ]
+
+
+def infer_vertical_hint(industry_vertical: str | None, project_description: str | None) -> str | None:
+    text = normalize_text(industry_vertical) or normalize_text(project_description)
+    if not text:
+        return None
+    if any(token in text for token in ["sled", "state", "local", "government", "public sector"]):
+        return "SLED"
+    if any(token in text for token in ["healthcare", "hospital", "medical", "clinic", "payer"]):
+        return "Healthcare"
+    if any(token in text for token in ["manufacturing", "factory", "industrial", "plant"]):
+        return "Manufacturing"
+    if any(token in text for token in ["finserve", "finance", "financial", "bank", "fintech"]):
+        return "Finserve"
+    if any(token in text for token in ["telecom", "media", "technology", "tech", "software", "saas"]):
+        return "Telecom, Media & Tech"
+    if any(token in text for token in ["utility", "utilities", "energy", "electric", "water", "gas"]):
+        return "Utilities"
+    return None
+
+
+def dedupe_assets_by_url(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    seen_stems: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in items:
+        url = clean_optional(str(item.get("url") or ""))
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        stem = normalize_asset_stem(clean_optional(str(item.get("title") or "")))
+        if stem and stem in seen_stems:
+            continue
+        seen.add(key)
+        if stem:
+            seen_stems.add(stem)
+        out.append(item)
+    return out
+
+
+def sharepoint_asset_sort_key(item: Mapping[str, Any]) -> tuple[float, int, float]:
+    score = float(item.get("score") or 0)
+    terms = item.get("matched_terms")
+    matched_count = len(terms) if isinstance(terms, list) else 0
+    last_modified = clean_optional(str(item.get("last_modified") or ""))
+    dt = iso_to_dt(last_modified)
+    recency = dt.timestamp() if dt else 0.0
+    return score, matched_count, recency
+
+
+def normalize_asset_stem(title: str | None) -> str:
+    value = normalize_text(title)
+    if not value:
+        return ""
+    value = re.sub(r"\.(pptx|ppt|pdf|docx|doc)$", "", value)
+    value = re.sub(r"\b(slide|deck|presentation)\b", " ", value)
+    value = re.sub(r"[-_]+", " ", value)
+    return compact_spaces(value)
+
+
+def summarize_external_error(payload: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return "unknown_error"
+    for key in ("error", "message", "details"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            msg = value.get("message") or value.get("error")
+            if msg:
+                return str(msg)
+        if value:
+            return str(value)
+    return "unknown_error"
+
+
+def extract_tool_payload_from_mcp_response(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        return None
+
+    nested_result = result.get("result")
+    if isinstance(nested_result, Mapping):
+        return nested_result
+
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, Mapping):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, Mapping):
+                return parsed
+
+    return result if isinstance(result, Mapping) else None
 
 
 def build_hubspot_request_headers(

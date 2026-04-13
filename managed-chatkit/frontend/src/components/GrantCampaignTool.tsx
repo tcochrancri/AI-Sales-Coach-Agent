@@ -80,9 +80,24 @@ type ApolloAccountSnapshotResponse = {
   lookup?: Record<string, unknown> | null;
 };
 
+type RecommendedAssetItem = {
+  id?: string;
+  title: string;
+  url: string;
+  thumbnail_url?: string | null;
+  thumbnail_base64?: string | null;
+  industry?: string | null;
+  score?: number | null;
+  reason?: string | null;
+  path?: string | null;
+  matched_terms?: string[];
+  source?: string;
+};
+
 type CaseStudyRecommendResponse = {
-  items?: Array<Record<string, unknown>>;
+  items?: RecommendedAssetItem[];
   message?: string;
+  source?: string;
 };
 
 type HubspotSummaryTile = {
@@ -631,12 +646,20 @@ function CampaignResultModal({
   const openSideBySideWorkspace = (
     url: string,
     workspaceName: string,
-    popupRef: MutableRefObject<Window | null>
+    popupRef: MutableRefObject<Window | null>,
+    titleOverride?: string
   ) => {
     if (!url) return;
     // Primary path: embedded side-by-side pane inside the modal.
     setEmbeddedWorkspaceUrl(url);
-    setEmbeddedWorkspaceTitle(workspaceName === "apollo_workspace" ? "Apollo Workspace" : "HubSpot Workspace");
+    const title =
+      titleOverride ??
+      (workspaceName === "apollo_workspace"
+        ? "Apollo Workspace"
+        : workspaceName === "hubspot_workspace"
+          ? "HubSpot Workspace"
+          : "Workspace");
+    setEmbeddedWorkspaceTitle(title);
     setSplitMode(true);
 
     // Keep popup refs available only for explicit fallback/new-window actions.
@@ -671,7 +694,11 @@ function CampaignResultModal({
   };
 
   const openHubspotWorkspaceLink = (url: string) => {
-    openSideBySideWorkspace(url, "hubspot_workspace", hubspotPopupRef);
+    openSideBySideWorkspace(normalizeWorkspaceUrl(url), "hubspot_workspace", hubspotPopupRef);
+  };
+
+  const openWebsiteWorkspaceLink = (url: string) => {
+    openSideBySideWorkspace(normalizeWorkspaceUrl(url), "website_workspace", hubspotPopupRef, "Organization Website");
   };
 
   const enrichRecipientEmailWithApollo = async (recipient: {
@@ -853,6 +880,8 @@ function CampaignResultModal({
         body: JSON.stringify({
           organization_name: orgName,
           industry_vertical: industryHint,
+          project_description:
+            result.campaign.strategy_summary || result.campaign.campaign_title || null,
           max_items: 3,
         }),
       });
@@ -860,7 +889,8 @@ function CampaignResultModal({
       if (!caseResp.ok) {
         setCaseStudyError(caseBody.error ?? `Case study lookup failed (${caseResp.status})`);
       } else {
-        setCaseStudies(caseBody);
+        const normalizedItems = normalizeRecommendedAssets(caseBody.items);
+        setCaseStudies({ ...caseBody, items: normalizedItems });
       }
       setActiveTab("overview");
     } catch (hubspotLoadError) {
@@ -1006,9 +1036,9 @@ function CampaignResultModal({
 
                   {activeTab === "overview" ? (
                     <>
-                      <section className="campaign-section">
+      <section className="campaign-section">
                         <h4>Executive Pitch Summary</h4>
-                        <p className="campaign-summary">{result.campaign.strategy_summary}</p>
+                        <ExecutivePitchSummary summary={result.campaign.strategy_summary} />
                       </section>
                       <section className="campaign-section account-snapshot-section">
                         <h4>Account Snapshot</h4>
@@ -1016,6 +1046,7 @@ function CampaignResultModal({
                           snapshot={apolloSnapshot}
                           onFindDomain={findDomainOnly}
                           findingDomain={apolloDomainLoading}
+                          onOpenWorkspaceLink={openWebsiteWorkspaceLink}
                         />
                       </section>
                     </>
@@ -1036,8 +1067,11 @@ function CampaignResultModal({
                         )}
                       </section>
                       <section className="campaign-section">
-                        <h4>Recommended Assets</h4>
+                        <h4>HubSpot Recommended Assets</h4>
                         {caseStudyError ? <p className="status-error">{caseStudyError}</p> : null}
+                        <p className="muted">
+                          Open any asset, download it from the resource, then attach manually in Apollo.
+                        </p>
                         <CaseStudiesPanel
                           data={caseStudies}
                           onOpenWorkspaceLink={openHubspotWorkspaceLink}
@@ -2064,10 +2098,12 @@ function ApolloSnapshotCard({
   snapshot,
   onFindDomain,
   findingDomain,
+  onOpenWorkspaceLink,
 }: {
   snapshot: ApolloAccountSnapshotResponse | null;
   onFindDomain: () => void;
   findingDomain: boolean;
+  onOpenWorkspaceLink: (url: string) => void;
 }) {
   if (!snapshot) {
     return <p className="muted">No Apollo account snapshot loaded yet.</p>;
@@ -2106,14 +2142,15 @@ function ApolloSnapshotCard({
           <p className="apollo-snapshot-metric-label">Domain</p>
           <div className="apollo-snapshot-metric-value">
             {domainPresent ? (
-              <a
-                href={`https://${domain}`}
-                target="_blank"
-                rel="noreferrer"
+              <button
+                type="button"
                 className="apollo-domain-link"
+                onClick={() => {
+                  onOpenWorkspaceLink(`https://${domain}`);
+                }}
               >
                 {domain}
-              </a>
+              </button>
             ) : (
               <button
                 type="button"
@@ -2287,6 +2324,40 @@ function PhoneCallPanel({
   );
 }
 
+function normalizeRecommendedAssets(items: unknown): RecommendedAssetItem[] {
+  const list = Array.isArray(items) ? items : [];
+  return list
+    .map((item, index) => {
+      const row = asRecord(item);
+      const title = readStringFromRecord(row, "title") || `Asset ${index + 1}`;
+      const url = readStringFromRecord(row, "url");
+      if (!url) return null;
+      const scoreRaw = row?.score;
+      return {
+        id: readStringFromRecord(row, "id") || undefined,
+        title,
+        url,
+        thumbnail_url:
+          readStringFromRecord(row, "thumbnail_url") ||
+          readStringFromRecord(row, "preview_url") ||
+          null,
+        thumbnail_base64:
+          readStringFromRecord(row, "thumbnail_base64") ||
+          readStringFromRecord(row, "preview_base64") ||
+          null,
+        industry: readStringFromRecord(row, "industry") || null,
+        score: typeof scoreRaw === "number" ? scoreRaw : null,
+        reason: readStringFromRecord(row, "reason") || null,
+        path: readStringFromRecord(row, "path") || null,
+        matched_terms: Array.isArray(row?.matched_terms)
+          ? row.matched_terms.map((term) => String(term))
+          : [],
+        source: readStringFromRecord(row, "source") || undefined,
+      } satisfies RecommendedAssetItem;
+    })
+    .filter((item): item is RecommendedAssetItem => Boolean(item));
+}
+
 function CaseStudiesPanel({
   data,
   onOpenWorkspaceLink,
@@ -2294,39 +2365,123 @@ function CaseStudiesPanel({
   data: CaseStudyRecommendResponse | null;
   onOpenWorkspaceLink: (url: string) => void;
 }) {
-  const items = Array.isArray(data?.items) ? data?.items : [];
+  const items = normalizeRecommendedAssets(data?.items);
   if (!items?.length) {
     return <p className="muted">{data?.message ?? "No case study recommendations available."}</p>;
   }
   return (
     <ul className="hubspot-list">
       {items.map((item, index) => {
-        const title = readStringFromRecord(item, "title") || `Case Study ${index + 1}`;
-        const url = readStringFromRecord(item, "url");
-        const industry = readStringFromRecord(item, "industry");
+        const title = item.title || `Case Study ${index + 1}`;
+        const url = item.url;
+        const previewUrl =
+          normalizeThumbnailSrc(item.thumbnail_base64) ||
+          item.thumbnail_url ||
+          buildSharepointPreviewImageUrl(url);
         return (
           <li key={`${title}-${index}`} className="hubspot-list-item">
-            <div>
-              <strong>{title}</strong>
-              <p className="muted">{industry || "Industry-aligned recommendation"}</p>
-            </div>
-            {url ? (
-              <a
-                href={url}
-                className="hubspot-link"
-                onClick={(event) => {
-                  event.preventDefault();
-                  onOpenWorkspaceLink(url);
-                }}
+            <div className="asset-item-main">
+              <button
+                type="button"
+                className="asset-title-button"
+                onClick={() => onOpenWorkspaceLink(url)}
               >
-                Open
-              </a>
-            ) : null}
+                {title}
+              </button>
+              {previewUrl ? (
+                <img
+                  src={previewUrl}
+                  alt={`${title} preview`}
+                  loading="lazy"
+                  className="asset-preview-image"
+                  onClick={() => onOpenWorkspaceLink(url)}
+                  onError={(event) => {
+                    event.currentTarget.style.display = "none";
+                  }}
+                />
+              ) : null}
+            </div>
+            <div className="asset-item-actions">
+              {url ? (
+                <a
+                  href={url}
+                  className="asset-action-button"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    onOpenWorkspaceLink(url);
+                  }}
+                >
+                  Open
+                </a>
+              ) : null}
+            </div>
           </li>
         );
       })}
     </ul>
   );
+}
+
+function buildSharepointPreviewImageUrl(url: string): string {
+  if (!url || !url.includes("sharepoint.com")) return "";
+  if (url.toLowerCase().includes("/_layouts/15/doc.aspx")) return "";
+  return apiUrl(`/api/assets/thumbnail?url=${encodeURIComponent(url)}`);
+}
+
+function ExecutivePitchSummary({ summary }: { summary: string }) {
+  const parsed = parsePitchSummary(summary);
+  return (
+    <ul className="campaign-summary-list">
+      <li className="campaign-summary-item">
+        <strong>Executive Summary:</strong> {parsed.executiveSummary}
+      </li>
+      {parsed.objective ? (
+        <li className="campaign-summary-item">
+          <strong>Objective:</strong> {parsed.objective}
+        </li>
+      ) : null}
+    </ul>
+  );
+}
+
+function parsePitchSummary(summary: string): { executiveSummary: string; objective: string | null } {
+  const text = String(summary || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return { executiveSummary: "No executive summary available.", objective: null };
+  }
+  const labelRegex = /\b(outcome|objective)\s*:\s*/i;
+  const labelMatch = labelRegex.exec(text);
+  if (!labelMatch || labelMatch.index < 0) {
+    return { executiveSummary: text, objective: null };
+  }
+  const executiveSummary = text.slice(0, labelMatch.index).trim().replace(/[:;\-]\s*$/, "");
+  const objective = text.slice(labelMatch.index + labelMatch[0].length).trim();
+  return {
+    executiveSummary: executiveSummary || text,
+    objective: objective || null,
+  };
+}
+
+function normalizeWorkspaceUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname.includes("sharepoint.com")) return url;
+    parsed.searchParams.delete("mobileredirect");
+    if (!parsed.searchParams.get("action")) {
+      parsed.searchParams.set("action", "edit");
+    }
+    parsed.searchParams.set("web", "1");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function normalizeThumbnailSrc(base64: string | null | undefined): string {
+  const raw = (base64 || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("data:image/")) return raw;
+  return `data:image/jpeg;base64,${raw}`;
 }
 
 function buildLeadershipReportHtml(
@@ -2998,4 +3153,3 @@ function buildEvidence(
     },
   ];
 }
-

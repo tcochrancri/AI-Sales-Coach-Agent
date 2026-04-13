@@ -29,6 +29,11 @@ What happens:
 - `VITE_CHATKIT_WORKFLOW_ID`
 - (optional) `GRANT_CAMPAIGN_MODEL` (default `gpt-4.1`)
 - (optional) `GRANT_RESEARCH_MODEL` (default `gpt-4.1-mini`)
+- (optional) `SHAREPOINT_MCP_BASE_URL` (used by `/api/case-studies/recommend` to call `sharepoint_matchBidFiles` and return top matched presentation assets)
+- (optional) `SHAREPOINT_MCP_BEARER` (if your SharePoint MCP server protects POST `/tools/*`)
+- (optional) `SHAREPOINT_MATCH_SHARE_URL` (override root folder; otherwise tool default share URL is used)
+- (optional) `SHAREPOINT_MATCH_FILE_EXTENSIONS` (comma-separated, default `pptx,ppt`)
+- (optional) `SHAREPOINT_PREPARE_PACKAGE_TOOL` (MCP tool used by `/api/assets/prepare-package`; default `sharepoint_prepareAttachmentPackage`)
 - (optional) `CHATKIT_API_BASE` or `VITE_CHATKIT_API_BASE` (defaults to `https://api.openai.com`)
 - (optional) `VITE_API_URL` (override the dev proxy target for `/api`)
 - (optional) `VITE_APOLLO_APP_URL` (default `https://app.apollo.io/`; used by "Open Apollo" button)
