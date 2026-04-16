@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 DEFAULT_CHATKIT_BASE = "https://api.openai.com"
@@ -189,7 +189,7 @@ class EvidenceItem(BaseModel):
 class ConstraintsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_recipients: int = Field(default=8, ge=1, le=25)
+    max_recipients: int = Field(default=2, ge=1, le=5)
     version: Literal[1] = 1
 
 
@@ -327,6 +327,7 @@ class HubspotContextRequest(BaseModel):
     max_items: int = Field(default=10, ge=1, le=50)
     years_back: int = Field(default=5, ge=1, le=25)
     closed_won_only: bool = True
+    project_signal_text: str | None = None
 
 
 class ApolloAccountSnapshotRequest(BaseModel):
@@ -371,6 +372,20 @@ class ApolloAttachEmailStepAssetsRequest(BaseModel):
     max_total_bytes: int = Field(default=150_000_000, ge=1_000_000, le=250_000_000)
     max_zip_bytes: int = Field(default=75_000_000, ge=1_000_000, le=100_000_000)
     assets: list[AssetPackageItem] = Field(default_factory=list, min_length=1, max_length=10)
+
+
+class GrantCampaignRegenerateEmailRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str | None = None
+    organization: OrganizationPayload = Field(default_factory=OrganizationPayload)
+    award: AwardPayload = Field(default_factory=AwardPayload)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    recipient_label: str
+    recipient_persona: str
+    recipient_rationale: str
+    target_email_number: Literal[1, 2, 3, 4]
+    existing_sequence: list[GrantEmail] = Field(default_factory=list, min_length=1, max_length=4)
 
 
 @app.post("/api/grant-campaign/generate")
@@ -481,6 +496,7 @@ async def generate_grant_campaign(request: Request) -> JSONResponse:
         )
         campaign = sanitize_campaign(campaign, payload, recipient_strategy)
         campaign = enforce_source_bound_campaign(campaign, project_research, prospect_briefs)
+        campaign = apply_sparse_signal_guardrails_to_campaign(campaign, payload)
     except RuntimeError as error:
         logger.exception("[grant:%s] generation failed: %s", request_id, error)
         return respond({"error": str(error)}, 502)
@@ -501,24 +517,131 @@ async def generate_grant_campaign(request: Request) -> JSONResponse:
         cost_summary["output_tokens"],
         cost_summary["web_search_calls"],
     )
+    response_payload: dict[str, Any] = {
+        "mode": payload.mode,
+        "lead_id": payload.lead_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "targeting_mode": "provided_prospects"
+        if payload.prospects
+        else "role_discovery",
+        "minimum_fields_used": {
+            "organization_name": payload.organization.name,
+            "organization_website": payload.organization.website,
+            "award_id": payload.award.award_id,
+        },
+        "campaign": campaign.model_dump(),
+        "campaign_text": render_campaign_text(campaign),
+    }
+    if include_debug_fields():
+        response_payload["debug_cost_estimate"] = cost_summary
+        response_payload["debug_prospect_briefs"] = [
+            brief.model_dump(mode="json") for brief in prospect_briefs
+        ]
+        response_payload["debug_project_research"] = project_research.model_dump(mode="json")
+    return respond(response_payload, 200)
+
+
+@app.post("/api/grant-campaign/regenerate-email")
+async def regenerate_grant_campaign_email(request: Request) -> JSONResponse:
+    request_id = str(uuid.uuid4())[:8]
+    logger.info("[grant:%s] regenerate-email request received", request_id)
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return respond({"error": "Missing OPENAI_API_KEY environment variable"}, 500)
+
+    body = await read_json_body(request)
+    try:
+        regen_request = GrantCampaignRegenerateEmailRequest.model_validate(body)
+    except ValidationError as error:
+        return respond({"error": "Invalid request payload", "details": error.errors()}, 400)
+
+    payload = normalize_grant_payload(
+        GrantCampaignGenerateRequest(
+            mode="grant_awardee_outreach",
+            lead_id=regen_request.lead_id,
+            organization=regen_request.organization,
+            award=regen_request.award,
+            evidence=regen_request.evidence,
+            prospects=[],
+            constraints=ConstraintsPayload(max_recipients=1, version=1),
+        )
+    )
+    recipient = GrantRecipient(
+        label=compact_spaces(regen_request.recipient_label),
+        persona=compact_spaces(regen_request.recipient_persona),
+        rationale=compact_spaces(regen_request.recipient_rationale),
+    )
+    existing_sequence = sanitize_email_block(
+        regen_request.existing_sequence, regen_request.recipient_label
+    )
+    research_model = os.getenv("GRANT_RESEARCH_MODEL", "gpt-4.1-mini")
+    model = os.getenv("GRANT_CAMPAIGN_MODEL", "gpt-4.1")
+    cost_tracker = init_cost_tracker(request_id)
+
+    project_research = await generate_project_research(
+        payload=payload,
+        api_key=api_key,
+        model=research_model,
+        request_id=request_id,
+        cost_tracker=cost_tracker,
+    )
+    regenerated = await regenerate_single_email(
+        payload=payload,
+        recipient=recipient,
+        existing_sequence=existing_sequence,
+        target_email_number=regen_request.target_email_number,
+        project_research=project_research,
+        api_key=api_key,
+        model=model,
+        request_id=request_id,
+        cost_tracker=cost_tracker,
+    )
+
+    replaced = False
+    updated_sequence: list[GrantEmail] = []
+    for email in existing_sequence:
+        if email.email_number == regen_request.target_email_number:
+            updated_sequence.append(regenerated)
+            replaced = True
+        else:
+            updated_sequence.append(email)
+    if not replaced:
+        updated_sequence.append(regenerated)
+
+    provisional_campaign = GrantCampaign(
+        campaign_title="Regenerated Sequence",
+        strategy_summary="Single email regeneration.",
+        recipients=[recipient],
+        prospect_campaigns=[
+            ProspectCampaign(
+                recipient_label=recipient.label,
+                recipient_persona=recipient.persona,
+                recipient_rationale=recipient.rationale,
+                emails=updated_sequence,
+            )
+        ],
+    )
+    cleaned_campaign = enforce_source_bound_campaign(
+        provisional_campaign,
+        project_research=project_research,
+        prospect_briefs=[],
+    )
+    cleaned_campaign = apply_sparse_signal_guardrails_to_campaign(cleaned_campaign, payload)
+    cleaned_sequence = sanitize_email_block(
+        cleaned_campaign.prospect_campaigns[0].emails, recipient.label
+    )
+    current_email = next(
+        (email for email in cleaned_sequence if email.email_number == regen_request.target_email_number),
+        None,
+    )
+    if not current_email:
+        return respond({"error": "Regenerated email could not be finalized."}, 500)
+
     return respond(
         {
-            "mode": payload.mode,
-            "lead_id": payload.lead_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "targeting_mode": "provided_prospects"
-            if payload.prospects
-            else "role_discovery",
-            "minimum_fields_used": {
-                "organization_name": payload.organization.name,
-                "organization_website": payload.organization.website,
-                "award_id": payload.award.award_id,
-            },
-            "campaign": campaign.model_dump(),
-            "campaign_text": render_campaign_text(campaign),
-            "debug_cost_estimate": cost_summary,
-            "debug_prospect_briefs": [brief.model_dump(mode="json") for brief in prospect_briefs],
-            "debug_project_research": project_research.model_dump(mode="json"),
+            "recipient_label": recipient.label,
+            "email": current_email.model_dump(),
+            "sequence": [email.model_dump() for email in cleaned_sequence],
         },
         200,
     )
@@ -575,9 +698,9 @@ async def hubspot_context(request: Request) -> JSONResponse:
                     domain,
                     query,
                 )
-    query_terms = [t for t in [query, domain] if t]
-    query_text = " ".join(query_terms)
-    query_tokens = split_query_tokens(query_text)
+    # Prefer name-based search to avoid stale-domain query poisoning.
+    query_text = query or domain or ""
+    query_tokens = split_query_tokens(query or query_text)
     fetch_limit = max(payload.max_items, 50)
     headers: dict[str, str] = {}
     if bearer:
@@ -637,6 +760,8 @@ async def hubspot_context(request: Request) -> JSONResponse:
             token_id=token_id,
             access_token=resolved_access_token,
             query_text=query_text,
+            org_name=query,
+            org_domain=domain,
             max_items=fetch_limit,
         )
 
@@ -668,6 +793,8 @@ async def hubspot_context(request: Request) -> JSONResponse:
                     token_id=token_id,
                     access_token=resolved_access_token,
                     query_text=query_text,
+                    org_name=query,
+                    org_domain=domain,
                     max_items=fetch_limit,
                 )
                 logger.info(
@@ -691,8 +818,25 @@ async def hubspot_context(request: Request) -> JSONResponse:
         companies_error = bundle["companies_error"]
         contacts_error = bundle["contacts_error"]
         deals_error = bundle["deals_error"]
+        companies_data = await extend_hubspot_companies_until_match(
+            client=client,
+            headers=request_headers,
+            install_id=install_id,
+            token_id=token_id,
+            access_token=resolved_access_token,
+            query_text=query_text,
+            org_name=query,
+            org_domain=domain,
+            companies_data=companies_data,
+        )
 
     companies_list = mapping_list(companies_data, "companies")
+    search_company_candidates = extract_company_candidates_from_hubspot_search(
+        search_data,
+        org_name=query,
+        org_domain=domain,
+    )
+    company_candidates = merge_company_candidates(companies_list, search_company_candidates)
     contacts_list = mapping_list(contacts_data, "contacts")
     deals_list = mapping_list(deals_data, "deals")
     account_match = await resolve_hubspot_account_match(
@@ -701,9 +845,15 @@ async def hubspot_context(request: Request) -> JSONResponse:
         org_industry=payload.organization_industry,
         org_city=payload.organization_city,
         org_state=payload.organization_state,
-        companies=companies_list,
+        search_data=search_data,
+        companies=company_candidates,
     )
-    exact_company_matches = filter_exact_company_matches(companies_list, query, domain)
+    recommended_action = build_recommended_action(
+        account_match=account_match,
+        deals=deals_list,
+        project_signal_text=payload.project_signal_text,
+    )
+    exact_company_matches = filter_exact_company_matches(company_candidates, query, domain)
     exact_contact_matches = filter_exact_contact_matches(contacts_list, query, domain)
     exact_deal_matches = filter_exact_deal_matches(deals_list, query, query_tokens)
     relationship_history = build_relationship_history(
@@ -746,6 +896,7 @@ async def hubspot_context(request: Request) -> JSONResponse:
 
     return respond(
         {
+            "retrieval_source": clean_optional(str(bundle.get("retrieval_source") or "")) or "unknown",
             "organization_name": query,
             "organization_domain": domain,
             "summary": summary_data,
@@ -763,6 +914,7 @@ async def hubspot_context(request: Request) -> JSONResponse:
                 ),
             },
             "account_match": account_match,
+            "recommended_action": recommended_action,
             "relationship_history": {
                 "events": relationship_history,
                 "total_events": len(relationship_history),
@@ -1066,27 +1218,31 @@ async def apollo_account_snapshot(request: Request) -> JSONResponse:
     if not org_name and not org_domain:
         return respond({"error": "organization_name or organization_website is required."}, 400)
 
+    domain_input_provided = bool(org_domain)
     async with httpx.AsyncClient(base_url="https://api.apollo.io", timeout=20.0) as client:
+        # Respect user-provided domain as authoritative. Only discover when missing.
         if not org_domain and org_name:
             org_domain = await discover_apollo_domain(
                 client=client,
                 api_key=api_key,
                 organization_name=org_name,
             )
+
         search_params: dict[str, Any] = {"page": 1, "per_page": 10}
         if org_name:
             search_params["q_organization_name"] = org_name
         if org_domain:
-            search_params["q_domain"] = org_domain
+            search_params["q_organization_domains_list[]"] = org_domain
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Api-Key": api_key,
+            "Cache-Control": "no-cache",
+        }
         try:
             search_resp = await client.post(
-                "/api/v1/mixed_companies/search",
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "X-Api-Key": api_key,
-                    "Cache-Control": "no-cache",
-                },
+                "/api/v1/organizations/search",
+                headers=headers,
                 params=search_params,
             )
             search_payload = parse_json(search_resp)
@@ -1118,15 +1274,12 @@ async def apollo_account_snapshot(request: Request) -> JSONResponse:
                     "per_page": 10,
                     "q_organization_name": candidate,
                 }
+                if org_domain:
+                    retry_params["q_organization_domains_list[]"] = org_domain
                 try:
                     retry_resp = await client.post(
-                        "/api/v1/mixed_companies/search",
-                        headers={
-                            "Content-Type": "application/json",
-                            "Accept": "application/json",
-                            "X-Api-Key": api_key,
-                            "Cache-Control": "no-cache",
-                        },
+                        "/api/v1/organizations/search",
+                        headers=headers,
                         params=retry_params,
                     )
                 except httpx.RequestError:
@@ -1139,20 +1292,23 @@ async def apollo_account_snapshot(request: Request) -> JSONResponse:
                     retry_orgs = retry_payload.get("accounts")
                 if isinstance(retry_orgs, list) and retry_orgs:
                     organizations = retry_orgs
-                    if not org_domain:
-                        org_domain = await discover_apollo_domain(
-                            client=client,
-                            api_key=api_key,
-                            organization_name=candidate,
-                        )
                     break
 
-        best = pick_best_apollo_org_match(organizations, org_name, org_domain)
-        if not best:
+        best, best_score, best_reasons = pick_best_apollo_org_match(
+            organizations, org_name, org_domain
+        )
+        if not best or best_score < 6:
             return respond(
                 {
                     "matched": False,
-                    "message": "No Apollo organization match found.",
+                    "message": "No high-confidence Apollo organization match found.",
+                    "lookup": {
+                        "query_name": org_name,
+                        "query_domain": org_domain,
+                        "lookup_confidence": "LOW",
+                        "match_score": best_score,
+                        "match_reason": best_reasons,
+                    },
                 },
                 200,
             )
@@ -1203,6 +1359,11 @@ async def apollo_account_snapshot(request: Request) -> JSONResponse:
                 detailed = None
 
         snapshot = build_apollo_snapshot(best, detailed)
+        apollo_domain_verified = bool(clean_optional(str(snapshot.get("domain") or "")))
+        if org_domain and not apollo_domain_verified:
+            snapshot["domain"] = org_domain
+
+        lookup_confidence = "HIGH" if best_score >= 10 else "MEDIUM"
         return respond(
             {
                 "matched": True,
@@ -1210,6 +1371,13 @@ async def apollo_account_snapshot(request: Request) -> JSONResponse:
                 "lookup": {
                     "query_name": org_name,
                     "query_domain": org_domain,
+                    "query_domain_source": "user_input"
+                    if domain_input_provided
+                    else ("discovered" if org_domain else "none"),
+                    "lookup_confidence": lookup_confidence,
+                    "match_score": best_score,
+                    "match_reason": best_reasons,
+                    "apollo_domain_verified": apollo_domain_verified,
                     "detailed_status": detailed_status,
                     "used_detailed_endpoint": bool(detailed),
                 },
@@ -1449,6 +1617,78 @@ async def get_asset_thumbnail(request: Request) -> Response:
 
     return respond({"error": "Preview unavailable for this asset URL."}, 404)
 
+@app.get("/api/web/embed")
+async def embed_web_page(request: Request) -> Response:
+    source_url = clean_optional(request.query_params.get("url"))
+    if not source_url:
+        return respond({"error": "Missing required query parameter: url"}, 400)
+
+    parsed = urlparse(source_url)
+    if parsed.scheme not in {"http", "https"}:
+        return respond({"error": "Only http/https URLs are supported."}, 400)
+    if not is_public_hostname(parsed.hostname):
+        return respond({"error": "Blocked host for embedded web proxy."}, 400)
+
+    safe_url = source_url
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            upstream = await client.get(
+                safe_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "User-Agent": "AI-Sales-Coach-Embed/1.0",
+                },
+            )
+    except httpx.RequestError as error:
+        logger.warning("[embed] request failed for %s: %s", safe_url, error)
+        fallback = (
+            "<html><body style=\"font-family:Arial,sans-serif;padding:16px\">"
+            "<h3>Unable to load site in workspace</h3>"
+            f"<p>{str(error)}</p>"
+            f"<p><a href=\"{safe_url}\" target=\"_blank\" rel=\"noreferrer\">Open in new tab</a></p>"
+            "</body></html>"
+        )
+        return HTMLResponse(content=fallback, status_code=502)
+
+    content_type = (upstream.headers.get("content-type") or "").lower()
+    if "text/html" not in content_type:
+        media_type = content_type.split(";")[0] if content_type else "application/octet-stream"
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "",
+            "Content-Security-Policy": "frame-ancestors 'self' *",
+        }
+        return Response(content=upstream.content, media_type=media_type, headers=headers)
+
+    html = upstream.text
+    final_url = str(upstream.url)
+
+    # Remove meta CSP/frame-busting from upstream page to improve iframe render success.
+    html = re.sub(
+        r'<meta[^>]+http-equiv=["\']Content-Security-Policy["\'][^>]*>',
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    if "<head" in html.lower():
+        html = re.sub(
+            r"(<head[^>]*>)",
+            rf"\\1<base href=\"{final_url}\"><meta name=\"referrer\" content=\"no-referrer\">",
+            html,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    else:
+        html = f"<base href=\"{final_url}\">" + html
+
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Frame-Options": "",
+        "Content-Security-Policy": "frame-ancestors 'self' *",
+    }
+    return HTMLResponse(content=html, status_code=upstream.status_code, headers=headers)
+
 
 def respond(
     payload: Mapping[str, Any], status_code: int, cookie_value: str | None = None
@@ -1470,6 +1710,11 @@ def respond(
 def is_prod() -> bool:
     env = (os.getenv("ENVIRONMENT") or os.getenv("NODE_ENV") or "").lower()
     return env == "production"
+
+
+def include_debug_fields() -> bool:
+    raw = (os.getenv("GRANT_INCLUDE_DEBUG_FIELDS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 async def read_json_body(request: Request) -> Mapping[str, Any]:
@@ -1667,6 +1912,37 @@ def token_fingerprint(token: str | None) -> str:
     return f"len:{len(t)}:...{suffix}"
 
 
+
+def load_hubspot_owner_overrides_from_env() -> dict[str, dict[str, str]]:
+    raw = clean_optional(os.getenv("HUBSPOT_OWNER_ID_MAP_JSON"))
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.warning("[hubspot] invalid HUBSPOT_OWNER_ID_MAP_JSON; expected JSON object")
+        return {}
+    if not isinstance(parsed, Mapping):
+        logger.warning("[hubspot] HUBSPOT_OWNER_ID_MAP_JSON ignored; top-level value must be an object")
+        return {}
+
+    out: dict[str, dict[str, str]] = {}
+    for key, value in parsed.items():
+        owner_id = clean_optional(str(key))
+        if not owner_id:
+            continue
+        if isinstance(value, str):
+            name = clean_optional(value) or ""
+            out[owner_id] = {"name": name, "email": ""}
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        name = clean_optional(str(value.get("name") or "")) or ""
+        email = clean_optional(str(value.get("email") or "")) or ""
+        if not name and not email:
+            continue
+        out[owner_id] = {"name": name, "email": email}
+    return out
 def get_cached_domain_for_org(org_name: str | None) -> str | None:
     key = normalize_text(org_name)
     if not key:
@@ -1749,6 +2025,35 @@ def normalize_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
+def normalize_entity_name(value: str | None) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    # If a trailing label is added for deal/context naming, strip it.
+    parts = re.split(r"\s[-|:]\s", text, maxsplit=1)
+    if len(parts) == 2 and any(
+        token in parts[1]
+        for token in [
+            "implementation",
+            "servicenow",
+            "project",
+            "grant-funded",
+            "consulting",
+            "outreach",
+            "phase",
+            "rollout",
+        ]
+    ):
+        text = parts[0]
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(
+        r"\b(inc|incorporated|llc|l l c|corp|corporation|co|company|ltd|plc|lp|llp|group|holdings)\b",
+        " ",
+        text,
+    )
+    return compact_spaces(text)
+
+
 def text_contains(haystack: str | None, needle: str | None) -> bool:
     h = normalize_text(haystack)
     n = normalize_text(needle)
@@ -1782,7 +2087,7 @@ def organization_aliases(org_name: str | None) -> set[str]:
     name = clean_optional(org_name)
     if not name:
         return set()
-    aliases: set[str] = {normalize_text(name)}
+    aliases: set[str] = {normalize_text(name), normalize_entity_name(name)}
     paren = re.findall(r"\(([^)]+)\)", name)
     for item in paren:
         text = normalize_text(item)
@@ -1797,6 +2102,67 @@ def organization_aliases(org_name: str | None) -> set[str]:
     return aliases
 
 
+def organization_core_tokens(name: str | None) -> set[str]:
+    stop = {
+        "inc",
+        "company",
+        "corp",
+        "corporation",
+        "group",
+        "services",
+        "solutions",
+        "technology",
+        "technologies",
+        "international",
+        "partners",
+        "partner",
+    }
+    raw = normalize_entity_name(name)
+    tokens = {token for token in split_query_tokens(raw) if token not in stop}
+    return tokens if tokens else token_set(raw)
+
+
+def names_likely_same(left: str | None, right: str | None) -> bool:
+    l = normalize_entity_name(left)
+    r = normalize_entity_name(right)
+    if not l or not r:
+        return False
+    if l == r:
+        return True
+    if l in r or r in l:
+        return True
+    left_tokens = organization_core_tokens(l)
+    right_tokens = organization_core_tokens(r)
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = left_tokens.intersection(right_tokens)
+    return len(overlap) >= 1
+
+
+def domain_name_alignment_score(name: str | None, domain: str | None) -> float:
+    host = derive_domain(domain)
+    if not host:
+        return 0.0
+    root = re.sub(r"[^a-z0-9]", "", host.split(".", 1)[0].lower())
+    if not root:
+        return 0.0
+    variants = [root]
+    for prefix in ("go", "my", "app", "the", "portal"):
+        if root.startswith(prefix) and len(root) - len(prefix) >= 4:
+            variants.append(root[len(prefix) :])
+    tokens = organization_core_tokens(name)
+    if not tokens:
+        return 0.0
+    best = 0.0
+    for variant in variants:
+        token_hits = sum(1 for token in tokens if len(token) >= 4 and token in variant)
+        if token_hits >= 2:
+            best = max(best, 0.22)
+        elif token_hits == 1:
+            best = max(best, 0.14)
+    return best
+
+
 def compute_company_match_score(
     *,
     org_name: str | None,
@@ -1804,37 +2170,57 @@ def compute_company_match_score(
     org_industry: str | None,
     org_city: str | None,
     org_state: str | None,
+    anchor_domains: set[str] | None,
+    anchor_names: set[str] | None,
     company: Mapping[str, Any],
 ) -> tuple[float, dict[str, Any]]:
     props = mapping_value(company, "properties") or {}
     company_name = clean_optional(str(props.get("name") or ""))
     company_domain = derive_domain(str(props.get("domain") or ""))
+    record_type = clean_optional(str(company.get("__entity_type") or "company")) or "company"
     company_city = normalize_text(clean_optional(str(props.get("city") or "")))
     company_state = normalize_text(clean_optional(str(props.get("state") or "")))
     company_industry = normalize_text(clean_optional(str(props.get("industry") or "")))
     org_industry_norm = normalize_text(org_industry)
     org_city_norm = normalize_text(org_city)
     org_state_norm = normalize_text(org_state)
-    org_name_norm = normalize_text(org_name)
+    org_name_norm = normalize_entity_name(org_name)
     aliases = organization_aliases(org_name)
 
     score = 0.0
     reasons: list[str] = []
 
     if org_domain and company_domain and company_domain == org_domain:
-        score += 0.55
+        score += 0.45
         reasons.append("domain_exact")
+    elif org_domain and company_domain:
+        alignment = domain_name_alignment_score(org_name, company_domain)
+        if alignment > 0:
+            score += alignment
+            reasons.append(f"domain_name_align:{alignment:.2f}")
+    if company_domain and anchor_domains and company_domain in anchor_domains:
+        score += 0.18
+        reasons.append("search_domain_anchor")
 
     org_tokens = token_set(org_name_norm)
-    company_tokens = token_set(company_name)
+    company_name_norm = normalize_entity_name(company_name)
+    company_tokens = token_set(company_name_norm)
     name_similarity = jaccard_similarity(org_tokens, company_tokens)
     if name_similarity > 0:
         score += min(0.35, name_similarity * 0.5)
         reasons.append(f"name_sim:{name_similarity:.2f}")
-
-    company_name_norm = normalize_text(company_name)
-    if aliases and any(alias and alias in company_name_norm for alias in aliases):
+    if names_likely_same(company_name_norm, org_name_norm):
         score += 0.2
+        reasons.append("name_normalized_match")
+    if anchor_names:
+        for anchor_name in anchor_names:
+            if names_likely_same(company_name_norm, anchor_name):
+                score += 0.12
+                reasons.append("search_name_anchor")
+                break
+
+    if aliases and any(alias and alias in company_name_norm for alias in aliases):
+        score += 0.05
         reasons.append("alias_match")
 
     industry_similarity = jaccard_similarity(token_set(org_industry_norm), token_set(company_industry))
@@ -1843,29 +2229,33 @@ def compute_company_match_score(
         reasons.append(f"industry_sim:{industry_similarity:.2f}")
 
     if org_city_norm and company_city and org_city_norm == company_city:
-        score += 0.05
+        score += 0.06
         reasons.append("city_match")
     if org_state_norm and company_state and org_state_norm == company_state:
-        score += 0.05
+        score += 0.06
         reasons.append("state_match")
 
     score = max(0.0, min(1.0, score))
+    owner_id = clean_optional(
+        str(props.get("hubspot_owner_id") or props.get("hs_owner_id") or props.get("owner_id") or "")
+    )
+    owner_name = clean_optional(str(props.get("hubspot_owner_name") or ""))
+    owner_email = clean_optional(str(props.get("hubspot_owner_email") or ""))
+    owner_display = owner_name or ""
+
     return score, {
         "id": clean_optional(str(company.get("id") or "")),
+        "record_type": record_type,
         "name": company_name,
         "domain": company_domain,
         "industry": clean_optional(str(props.get("industry") or "")),
         "city": clean_optional(str(props.get("city") or "")),
         "state": clean_optional(str(props.get("state") or "")),
         "country": clean_optional(str(props.get("country") or "")),
-        "owner": clean_optional(
-            str(
-                props.get("hubspot_owner_id")
-                or props.get("hs_owner_id")
-                or props.get("owner_id")
-                or ""
-            )
-        ),
+        "owner": owner_display,
+        "owner_id": owner_id,
+        "owner_name": owner_name,
+        "owner_email": owner_email,
         "tier": clean_optional(
             str(props.get("account_tier") or props.get("tier") or props.get("segment") or "")
         ),
@@ -1882,6 +2272,239 @@ def compute_company_match_score(
         "score": round(score, 4),
         "reasons": reasons,
     }
+
+
+def extract_hubspot_search_anchors(search_data: Mapping[str, Any] | None) -> dict[str, set[str]]:
+    domains: set[str] = set()
+    names: set[str] = set()
+    if not isinstance(search_data, Mapping):
+        return {"domains": domains, "names": names}
+
+    name_keys = {
+        "name",
+        "company",
+        "company_name",
+        "associated_company",
+        "associatedcompany",
+        "organization",
+        "account",
+    }
+    domain_keys = {"domain", "website", "company_domain", "url"}
+    email_keys = {"email"}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                key_norm = normalize_text(str(key))
+                if key_norm in name_keys and isinstance(value, str):
+                    nm = normalize_entity_name(value)
+                    if nm:
+                        names.add(nm)
+                elif key_norm in domain_keys and isinstance(value, str):
+                    dm = derive_domain(value)
+                    if dm:
+                        domains.add(dm)
+                elif key_norm in email_keys and isinstance(value, str):
+                    email = clean_optional(value)
+                    if email and "@" in email:
+                        dm = derive_domain(email.split("@", 1)[1])
+                        if dm:
+                            domains.add(dm)
+                walk(value)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if isinstance(node, str):
+            dm = derive_domain(node)
+            if dm:
+                domains.add(dm)
+
+    walk(search_data)
+    return {"domains": domains, "names": names}
+
+
+def build_company_candidate(
+    *,
+    candidate_id: str | None,
+    name: str | None,
+    domain: str | None,
+    entity_type: str | None = None,
+    industry: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    country: str | None = None,
+    owner: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any] | None:
+    clean_name = clean_optional(name)
+    clean_domain = derive_domain(domain)
+    if not clean_name and not clean_domain:
+        return None
+    resolved_id = clean_optional(candidate_id)
+    if not resolved_id:
+        key = clean_domain or normalize_text(clean_name)
+        resolved_id = f"search::{key or 'candidate'}"
+    return {
+        "id": resolved_id,
+        "__entity_type": clean_optional(entity_type) or "company",
+        "url": clean_optional(url),
+        "properties": {
+            "name": clean_name or "",
+            "domain": clean_domain or "",
+            "industry": clean_optional(industry) or "",
+            "city": clean_optional(city) or "",
+            "state": clean_optional(state) or "",
+            "country": clean_optional(country) or "",
+            "hubspot_owner_id": clean_optional(owner) or "",
+        },
+    }
+
+
+def candidate_dedupe_key(company: Mapping[str, Any]) -> str:
+    props = mapping_value(company, "properties") or {}
+    company_id = clean_optional(str(company.get("id") or ""))
+    company_domain = derive_domain(str(props.get("domain") or ""))
+    company_name = normalize_entity_name(str(props.get("name") or ""))
+    if company_id:
+        return f"id:{company_id}"
+    if company_domain:
+        return f"domain:{company_domain}"
+    return f"name:{company_name}"
+
+
+def is_synthetic_company_id(value: str | None) -> bool:
+    text = clean_optional(value)
+    if not text:
+        return True
+    return text.startswith("search::") or text.startswith("search-discovery::")
+
+
+def infer_search_entity_type(node: Mapping[str, Any], props: Mapping[str, Any]) -> str:
+    tokens = " ".join(
+        [
+            normalize_text(str(node.get("type") or "")),
+            normalize_text(str(node.get("object_type") or "")),
+            normalize_text(str(node.get("objectType") or "")),
+            normalize_text(str(node.get("entity_type") or "")),
+            normalize_text(str(node.get("entityType") or "")),
+            normalize_text(str(props.get("type") or "")),
+            normalize_text(str(props.get("object_type") or "")),
+            normalize_text(str(props.get("entity_type") or "")),
+        ]
+    )
+    if "contact" in tokens or "person" in tokens:
+        return "contact"
+    if "deal" in tokens or "opportunit" in tokens:
+        return "deal"
+    if "company" in tokens or "organization" in tokens or "account" in tokens:
+        return "company"
+    return "unknown"
+
+
+def extract_company_candidates_from_hubspot_search(
+    search_data: Mapping[str, Any] | None,
+    *,
+    org_name: str | None,
+    org_domain: str | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(search_data, Mapping):
+        return []
+
+    name_keys = ("name", "company", "company_name", "associated_company", "organization", "account")
+    domain_keys = ("domain", "company_domain", "website", "url")
+    id_keys = ("id", "company_id", "hs_object_id", "object_id", "record_id")
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def append_candidate(candidate: dict[str, Any] | None) -> None:
+        if not candidate:
+            return
+        props = mapping_value(candidate, "properties") or {}
+        entity_type = clean_optional(str(candidate.get("__entity_type") or "")) or "unknown"
+        if entity_type not in {"company", "organization", "account", "unknown"}:
+            return
+        name = clean_optional(str(props.get("name") or ""))
+        domain = derive_domain(str(props.get("domain") or ""))
+        candidate_id = clean_optional(str(candidate.get("id") or ""))
+        # Enterprise guardrail: never promote domain-only ghost candidates as concrete account records.
+        if not name or not domain:
+            return
+        if not candidate_id and entity_type != "company":
+            return
+        relevant = False
+        if org_domain and domain and domain == org_domain:
+            relevant = True
+        if not relevant and org_name and name and names_likely_same(name, org_name):
+            relevant = True
+        if not relevant and org_name and domain and domain_name_alignment_score(org_name, domain) >= 0.14:
+            relevant = True
+        if not relevant:
+            return
+        key = candidate_dedupe_key(candidate)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(candidate)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            props = mapping_value(node, "properties") or {}
+            entity_type = infer_search_entity_type(node, props)
+            node_name = first_non_empty(node, list(name_keys)) or first_non_empty(props, list(name_keys))
+            node_domain = first_non_empty(node, list(domain_keys)) or first_non_empty(props, list(domain_keys))
+            node_id = first_non_empty(node, list(id_keys)) or first_non_empty(props, list(id_keys))
+            node_industry = first_non_empty(node, ["industry"]) or first_non_empty(props, ["industry"])
+            node_city = first_non_empty(node, ["city"]) or first_non_empty(props, ["city"])
+            node_state = first_non_empty(node, ["state"]) or first_non_empty(props, ["state"])
+            node_country = first_non_empty(node, ["country"]) or first_non_empty(props, ["country"])
+            node_owner = first_non_empty(
+                node, ["hubspot_owner_id", "hs_owner_id", "owner_id"]
+            ) or first_non_empty(props, ["hubspot_owner_id", "hs_owner_id", "owner_id"])
+            node_url = first_non_empty(node, ["url"]) or first_non_empty(props, ["url"])
+            append_candidate(
+                build_company_candidate(
+                    candidate_id=str(node_id or ""),
+                    name=str(node_name or ""),
+                    domain=str(node_domain or ""),
+                    entity_type=entity_type,
+                    industry=str(node_industry or ""),
+                    city=str(node_city or ""),
+                    state=str(node_state or ""),
+                    country=str(node_country or ""),
+                    owner=str(node_owner or ""),
+                    url=str(node_url or ""),
+                )
+            )
+
+            for value in node.values():
+                walk(value)
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(search_data)
+    return out
+
+
+def merge_company_candidates(
+    primary: list[Mapping[str, Any]], extras: list[Mapping[str, Any]]
+) -> list[Mapping[str, Any]]:
+    merged: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for source in [primary, extras]:
+        for company in source:
+            if not isinstance(company, Mapping):
+                continue
+            key = candidate_dedupe_key(company)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(company)
+    return merged
 
 
 async def ai_rank_company_candidates(
@@ -1965,8 +2588,18 @@ async def resolve_hubspot_account_match(
     org_industry: str | None,
     org_city: str | None,
     org_state: str | None,
+    search_data: Mapping[str, Any] | None,
     companies: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    search_anchors = extract_hubspot_search_anchors(search_data)
+    anchor_domains = search_anchors.get("domains") or set()
+    anchor_names = search_anchors.get("names") or set()
+    search_domain_hit = bool(org_domain and org_domain in anchor_domains)
+    search_name_hit = bool(
+        org_name
+        and any(names_likely_same(org_name, candidate_name) for candidate_name in anchor_names)
+    )
+
     scored: list[dict[str, Any]] = []
     for company in companies:
         score, details = compute_company_match_score(
@@ -1975,6 +2608,8 @@ async def resolve_hubspot_account_match(
             org_industry=org_industry,
             org_city=org_city,
             org_state=org_state,
+            anchor_domains=anchor_domains,
+            anchor_names=anchor_names,
             company=company,
         )
         if score <= 0:
@@ -2012,18 +2647,234 @@ async def resolve_hubspot_account_match(
                 selected_reason = str(ai_result.get("reason") or "AI candidate ranking")
                 selected_method = "ai_assisted"
 
-    matched = bool(selected and selected_confidence >= 0.65)
-    confident_match = bool(selected and selected_confidence >= 0.85)
+    selected_id = clean_optional(str(selected.get("id") or "")) if selected else None
+    selected_name = clean_optional(str(selected.get("name") or "")) if selected else None
+    selected_record_type = clean_optional(str(selected.get("record_type") or "")) if selected else None
+    has_real_candidate = bool(
+        selected_id
+        and not is_synthetic_company_id(selected_id)
+        and (selected_record_type or "company") == "company"
+        and selected_name
+    )
+
+    matched = bool(selected and selected_confidence >= 0.5)
+    confident_match = bool(selected and selected_confidence >= 0.85 and has_real_candidate)
+    if not matched:
+        strong_search_evidence = search_domain_hit or (search_name_hit and bool(anchor_domains))
+        if strong_search_evidence:
+            matched = True
+            confident_match = False
+            selected_confidence = max(selected_confidence, 0.55 if search_domain_hit else 0.52)
+            selected_method = "search_discovery"
+            evidence_terms: list[str] = []
+            if search_domain_hit:
+                evidence_terms.append("search_domain_hit")
+            if search_name_hit:
+                evidence_terms.append("search_name_hit")
+            selected_reason = (
+                "search evidence supports likely account match"
+                + (f" ({', '.join(evidence_terms)})" if evidence_terms else "")
+            )
+            if not selected:
+                selected = {
+                    "id": f"search-discovery::{org_domain or normalize_text(org_name) or 'candidate'}",
+                    "record_type": "synthetic",
+                    "name": clean_optional(org_name) or "",
+                    "domain": org_domain or "",
+                    "industry": clean_optional(org_industry) or "",
+                    "city": clean_optional(org_city) or "",
+                    "state": clean_optional(org_state) or "",
+                    "country": "",
+                    "owner": "",
+                    "tier": "",
+                    "territory": "",
+                    "url": "",
+                    "score": round(selected_confidence, 4),
+                    "reasons": ["search_discovery_fallback"],
+                }
+                selected_reason += " | fallback company candidate synthesized from search evidence"
+    confirmable = bool(has_real_candidate)
     return {
         "matched": matched,
         "confident_match": confident_match,
+        "confirmable": confirmable,
         "confidence": round(selected_confidence, 4),
         "method": selected_method,
         "reason": selected_reason,
         "selected_company": selected,
         "top_candidates": top_candidates[:5],
-        "thresholds": {"match": 0.65, "confident": 0.85},
+        "thresholds": {"match": 0.5, "confident": 0.85},
         "ai_used": bool(ai_result),
+        "search_evidence": {
+            "domain_hit": search_domain_hit,
+            "name_hit": search_name_hit,
+            "anchor_domains_count": len(anchor_domains),
+            "anchor_names_count": len(anchor_names),
+        },
+    }
+
+
+def parse_boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = normalize_text(str(value or ""))
+    return text in {"true", "1", "yes", "y"}
+
+
+def deal_is_open(props: Mapping[str, Any]) -> bool:
+    if "hs_is_closed" in props:
+        return not parse_boolish(props.get("hs_is_closed"))
+    stage = normalize_text(str(props.get("dealstage") or ""))
+    if "closedwon" in stage or "closed_won" in stage:
+        return False
+    if "closedlost" in stage or "closed_lost" in stage:
+        return False
+    return True
+
+
+def deal_is_closed_lost(props: Mapping[str, Any]) -> bool:
+    if "hs_is_closed" in props and parse_boolish(props.get("hs_is_closed")):
+        if "hs_is_closed_won" in props:
+            return not parse_boolish(props.get("hs_is_closed_won"))
+    stage = normalize_text(str(props.get("dealstage") or ""))
+    return "closedlost" in stage or "closed_lost" in stage
+
+
+def deal_matches_selected_company(
+    deal: Mapping[str, Any], selected_company: Mapping[str, Any] | None
+) -> bool:
+    if not isinstance(selected_company, Mapping):
+        return True
+    selected_id = clean_optional(str(selected_company.get("id") or ""))
+    selected_name = normalize_entity_name(str(selected_company.get("name") or ""))
+    selected_domain = derive_domain(str(selected_company.get("domain") or ""))
+    props = mapping_value(deal, "properties") or {}
+
+    if selected_id:
+        for key in (
+            "associatedcompanyid",
+            "associated_company_id",
+            "hs_company_id",
+            "company_id",
+            "hubspot_company_id",
+        ):
+            value = clean_optional(str(props.get(key) or ""))
+            if value and value == selected_id:
+                return True
+
+    company_text = normalize_text(
+        " ".join(
+            [
+                str(props.get("company") or ""),
+                str(props.get("associatedcompanyname") or ""),
+                str(props.get("associated_company_name") or ""),
+                str(props.get("account_name") or ""),
+                str(props.get("dealname") or ""),
+            ]
+        )
+    )
+    if selected_name and selected_name in company_text:
+        return True
+
+    if selected_domain:
+        root = normalize_text(selected_domain.split(".", 1)[0])
+        if root and root in company_text:
+            return True
+    return False
+
+
+def build_recommended_action(
+    *,
+    account_match: Mapping[str, Any] | None,
+    deals: list[Mapping[str, Any]],
+    project_signal_text: str | None,
+) -> dict[str, str]:
+    selected = mapping_value(account_match, "selected_company")
+    matched = bool(account_match and account_match.get("matched"))
+    confirmable = bool(account_match and account_match.get("confirmable"))
+    owner_name = clean_optional(str(selected.get("owner_name") or "")) if selected else None
+    owner_id = clean_optional(str(selected.get("owner_id") or "")) if selected else None
+    owner_present = bool(owner_name or owner_id)
+
+    if not matched or not confirmable:
+        return {
+            "code": "needs_human_review",
+            "label": "Needs Human Review",
+            "rationale": "CRM signals are not confirmable enough for automated outreach guidance.",
+            "next_step": "Review matched account and confirm the correct company record before outreach.",
+            "do_not_do": "Do not send sequence emails until account confirmation is complete.",
+        }
+
+    matched_deals: list[Mapping[str, Any]] = [
+        deal for deal in deals if deal_matches_selected_company(deal, selected)
+    ]
+    open_deals = [
+        deal
+        for deal in matched_deals
+        if deal_is_open(mapping_value(deal, "properties") or {})
+    ]
+
+    if open_deals:
+        if owner_present:
+            return {
+                "code": "coordinate_with_owner_first",
+                "label": "Coordinate With Owner First",
+                "rationale": "There is active opportunity context on this account and an internal owner is assigned.",
+                "next_step": "Align with the account owner on contact strategy before customer outreach.",
+                "do_not_do": "Do not run an independent outbound sequence without owner alignment.",
+            }
+        return {
+            "code": "outreach_now_warm",
+            "label": "Outreach Now (Warm)",
+            "rationale": "Account is active and no owner conflict signal is available.",
+            "next_step": "Send a warm outreach referencing active implementation context and propose a scope review.",
+            "do_not_do": "Do not use cold-intro messaging that ignores existing account activity.",
+        }
+
+    # No open deals: inspect most recent matched deal state.
+    def deal_ts(deal: Mapping[str, Any]) -> float:
+        props = mapping_value(deal, "properties") or {}
+        values = [
+            clean_optional(str(props.get("hs_lastmodifieddate") or "")),
+            clean_optional(str(props.get("closedate") or "")),
+            clean_optional(str(deal.get("updatedAt") or "")),
+            clean_optional(str(deal.get("createdAt") or "")),
+        ]
+        for value in values:
+            dt = iso_to_dt(value)
+            if dt:
+                return dt.timestamp()
+        return 0.0
+
+    latest_deal = sorted(matched_deals, key=deal_ts, reverse=True)[0] if matched_deals else None
+    latest_props = mapping_value(latest_deal, "properties") if latest_deal else None
+    latest_closed_lost = bool(latest_props and deal_is_closed_lost(latest_props))
+    signal_text = clean_optional(project_signal_text)
+    has_new_trigger = bool(signal_text and len(signal_text) >= 20)
+
+    if latest_closed_lost:
+        if has_new_trigger:
+            return {
+                "code": "reopen_closed_lost_with_new_trigger",
+                "label": "Reopen Closed-Lost With New Trigger",
+                "rationale": "Latest matched deal is closed-lost, and a project signal was provided for this run.",
+                "next_step": "Re-enter with trigger-led messaging and request a scoped reset conversation.",
+                "do_not_do": "Do not re-send the previous sequence without explicitly referencing the new trigger.",
+            }
+        return {
+            "code": "do_not_outreach_no_new_signal",
+            "label": "Do Not Outreach (No New Signal)",
+            "rationale": "Latest matched deal is closed-lost and no new trigger is present.",
+            "next_step": "Pause outbound and capture a fresh trigger before re-engagement.",
+            "do_not_do": "Do not push a standard campaign into a recently closed-lost account without new context.",
+        }
+
+    return {
+        "code": "outreach_now_warm",
+        "label": "Outreach Now (Warm)",
+        "rationale": "Matched account has no blocking active-opportunity conflict.",
+        "next_step": "Run warm outreach tied to known account context and propose a working session.",
+        "do_not_do": "Do not use generic cold messaging.",
     }
 
 
@@ -2085,7 +2936,7 @@ def filter_exact_company_matches(
         matched = False
         if org_domain and domain and domain == org_domain:
             matched = True
-        if not matched and org_name and text_contains(name, org_name):
+        if not matched and org_name and names_likely_same(name, org_name):
             matched = True
         if not matched:
             continue
@@ -2613,6 +3464,96 @@ def infer_vertical_hint(industry_vertical: str | None, project_description: str 
     return None
 
 
+def has_direct_company_candidate(
+    companies: list[Mapping[str, Any]], org_name: str | None, org_domain: str | None
+) -> bool:
+    for company in companies:
+        props = mapping_value(company, "properties") or {}
+        name = clean_optional(str(props.get("name") or ""))
+        domain = derive_domain(str(props.get("domain") or ""))
+        if org_domain and domain and domain == org_domain:
+            return True
+        if org_name and name and names_likely_same(name, org_name):
+            return True
+    return False
+
+
+async def extend_hubspot_companies_until_match(
+    *,
+    client: httpx.AsyncClient,
+    headers: Mapping[str, str],
+    install_id: str | None,
+    token_id: str | None,
+    access_token: str | None,
+    query_text: str | None,
+    org_name: str | None,
+    org_domain: str | None,
+    companies_data: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(companies_data, Mapping):
+        return companies_data
+    merged: list[Mapping[str, Any]] = list(mapping_list(companies_data, "companies"))
+    if not merged:
+        return companies_data
+    if has_direct_company_candidate(merged, org_name, org_domain):
+        return companies_data
+
+    paging = mapping_value(companies_data, "paging")
+    next_block = mapping_value(paging, "next")
+    after = clean_optional(str(next_block.get("after") or "")) if next_block else None
+    if not after:
+        return companies_data
+
+    max_pages_raw = clean_optional(os.getenv("HUBSPOT_COMPANY_SCAN_MAX_PAGES"))
+    try:
+        max_pages = max(1, min(20, int(max_pages_raw or "8")))
+    except ValueError:
+        max_pages = 8
+
+    seen: set[str] = set()
+    for item in merged:
+        if isinstance(item, Mapping):
+            seen.add(candidate_dedupe_key(item))
+
+    page_count = 0
+    latest_after = after
+    while latest_after and page_count < max_pages and not has_direct_company_candidate(
+        merged, org_name, org_domain
+    ):
+        params = {**build_hubspot_base_params(install_id, token_id, access_token), "limit": 50, "after": latest_after}
+        if query_text:
+            params.update({"q": query_text, "query": query_text, "search": query_text, "term": query_text})
+        page_payload, page_error = await fetch_external_json(
+            client=client,
+            method="GET",
+            path="/hubspot/companies",
+            headers=headers,
+            params=params,
+        )
+        if page_error or not isinstance(page_payload, Mapping):
+            break
+        page_companies = mapping_list(page_payload, "companies")
+        for company in page_companies:
+            key = candidate_dedupe_key(company)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(company)
+        page_paging = mapping_value(page_payload, "paging")
+        page_next = mapping_value(page_paging, "next")
+        latest_after = clean_optional(str(page_next.get("after") or "")) if page_next else None
+        page_count += 1
+
+    if not merged:
+        return companies_data
+    updated = dict(companies_data)
+    updated["companies"] = merged
+    updated["count"] = len(merged)
+    if latest_after:
+        updated["paging"] = {"next": {"after": latest_after}}
+    return updated
+
+
 def dedupe_assets_by_url(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     seen_stems: set[str] = set()
@@ -2748,6 +3689,592 @@ def hubspot_section_accessible(summary_data: dict[str, Any] | None, section: str
     return section_data.get("accessible") is not False
 
 
+def hubspot_direct_search_enabled() -> bool:
+    raw = clean_optional(os.getenv("HUBSPOT_DIRECT_SEARCH_ENABLED"))
+    if not raw:
+        return True
+    return normalize_text(raw) not in {"0", "false", "off", "no"}
+
+
+def hubspot_crm_headers(access_token: str | None) -> dict[str, str]:
+    token = clean_env_secret_single_line(access_token)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def extract_hubspot_results(payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, Mapping):
+        return []
+    raw = payload.get("results")
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, Mapping)]
+
+
+def extract_hubspot_after(payload: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    paging = mapping_value(payload, "paging")
+    next_block = mapping_value(paging, "next")
+    return clean_optional(str(next_block.get("after") or "")) if next_block else None
+
+
+def append_unique_hubspot_records(target: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> None:
+    seen_ids = {
+        clean_optional(str(item.get("id") or ""))
+        for item in target
+        if clean_optional(str(item.get("id") or ""))
+    }
+    for item in incoming:
+        item_id = clean_optional(str(item.get("id") or ""))
+        if item_id and item_id in seen_ids:
+            continue
+        if item_id:
+            seen_ids.add(item_id)
+        target.append(item)
+
+
+def collect_owner_ids_from_hubspot_records(records: list[dict[str, Any]]) -> set[str]:
+    owner_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        props = mapping_value(record, "properties") or {}
+        for key in ("hubspot_owner_id", "hs_owner_id", "owner_id"):
+            value = clean_optional(str(props.get(key) or ""))
+            if value:
+                owner_ids.add(value)
+    return owner_ids
+
+
+async def fetch_hubspot_owner_map(
+    *, client: httpx.AsyncClient, access_token: str | None, owner_ids: set[str]
+) -> dict[str, dict[str, str]]:
+    if not owner_ids or not clean_env_secret_single_line(access_token):
+        return {}
+    headers = hubspot_crm_headers(access_token)
+    endpoint = "https://api.hubapi.com/crm/v3/owners"
+    after: str | None = None
+    max_pages = 10
+    pages = 0
+    owners: dict[str, dict[str, str]] = {}
+
+    while pages < max_pages:
+        params: dict[str, Any] = {"limit": 100, "archived": "false"}
+        if after:
+            params["after"] = after
+        payload, error = await fetch_external_json(
+            client=client,
+            method="GET",
+            path=endpoint,
+            headers=headers,
+            params=params,
+        )
+        if error or not isinstance(payload, Mapping):
+            break
+        rows = payload.get("results")
+        if not isinstance(rows, list) or not rows:
+            break
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            owner_id = clean_optional(str(item.get("id") or item.get("ownerId") or ""))
+            if not owner_id:
+                continue
+            first = clean_optional(str(item.get("firstName") or ""))
+            last = clean_optional(str(item.get("lastName") or ""))
+            full_name = compact_spaces(" ".join(part for part in [first, last] if part))
+            email = clean_optional(str(item.get("email") or ""))
+            owners[owner_id] = {
+                "name": full_name or "",
+                "email": email or "",
+            }
+        if owner_ids.issubset(set(owners.keys())):
+            break
+        after = extract_hubspot_after(payload)
+        pages += 1
+        if not after:
+            break
+
+    missing = [owner_id for owner_id in owner_ids if owner_id not in owners]
+    if missing:
+        legacy_payload, legacy_error = await fetch_external_json(
+            client=client,
+            method="GET",
+            path="https://api.hubapi.com/owners/v2/owners",
+            headers=headers,
+            params={},
+        )
+        if not legacy_error:
+            legacy_rows: list[Any] = []
+            if isinstance(legacy_payload, list):
+                legacy_rows = legacy_payload
+            elif isinstance(legacy_payload, Mapping):
+                maybe = legacy_payload.get("results")
+                if isinstance(maybe, list):
+                    legacy_rows = maybe
+            for item in legacy_rows:
+                if not isinstance(item, Mapping):
+                    continue
+                legacy_id = clean_optional(
+                    str(item.get("ownerId") or item.get("id") or item.get("owner_id") or "")
+                )
+                if not legacy_id or legacy_id in owners:
+                    continue
+                first = clean_optional(str(item.get("firstName") or ""))
+                last = clean_optional(str(item.get("lastName") or ""))
+                full_name = compact_spaces(" ".join(part for part in [first, last] if part))
+                email = clean_optional(str(item.get("email") or ""))
+                owners[legacy_id] = {
+                    "name": full_name or "",
+                    "email": email or "",
+                }
+
+    missing = [owner_id for owner_id in owner_ids if owner_id not in owners]
+    for owner_id in missing:
+        resolved_payload: Mapping[str, Any] | None = None
+        for id_property in ["id", "userId"]:
+            payload, error = await fetch_external_json(
+                client=client,
+                method="GET",
+                path=f"https://api.hubapi.com/crm/v3/owners/{owner_id}",
+                headers=headers,
+                params={"idProperty": id_property},
+            )
+            if not error and isinstance(payload, Mapping):
+                resolved_payload = payload
+                break
+        if not isinstance(resolved_payload, Mapping):
+            continue
+        first = clean_optional(str(resolved_payload.get("firstName") or ""))
+        last = clean_optional(str(resolved_payload.get("lastName") or ""))
+        full_name = compact_spaces(" ".join(part for part in [first, last] if part))
+        email = clean_optional(str(resolved_payload.get("email") or ""))
+        owners[owner_id] = {
+            "name": full_name or "",
+            "email": email or "",
+        }
+    overrides = load_hubspot_owner_overrides_from_env()
+    if overrides:
+        for owner_id in owner_ids:
+            override = overrides.get(owner_id)
+            if not isinstance(override, Mapping):
+                continue
+            existing = owners.get(owner_id) if isinstance(owners.get(owner_id), Mapping) else {}
+            existing_name = clean_optional(str(existing.get("name") or "")) if isinstance(existing, Mapping) else None
+            existing_email = clean_optional(str(existing.get("email") or "")) if isinstance(existing, Mapping) else None
+            override_name = clean_optional(str(override.get("name") or ""))
+            override_email = clean_optional(str(override.get("email") or ""))
+            owners[owner_id] = {
+                "name": override_name or existing_name or "",
+                "email": override_email or existing_email or "",
+            }
+
+    return owners
+
+
+async def fetch_deal_stage_map(
+    *, client: httpx.AsyncClient, access_token: str | None
+) -> dict[str, dict[str, str]]:
+    if not clean_env_secret_single_line(access_token):
+        return {}
+    headers = hubspot_crm_headers(access_token)
+    endpoint = "https://api.hubapi.com/crm/v3/pipelines/deals"
+    payload, error = await fetch_external_json(
+        client=client,
+        method="GET",
+        path=endpoint,
+        headers=headers,
+        params={"archived": "false"},
+    )
+    if error or not isinstance(payload, Mapping):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    pipelines = payload.get("results")
+    if not isinstance(pipelines, list):
+        return out
+    for pipeline in pipelines:
+        if not isinstance(pipeline, Mapping):
+            continue
+        pipeline_id = clean_optional(str(pipeline.get("id") or ""))
+        stages = pipeline.get("stages")
+        if not isinstance(stages, list):
+            continue
+        for stage in stages:
+            if not isinstance(stage, Mapping):
+                continue
+            stage_id = clean_optional(str(stage.get("id") or ""))
+            if not stage_id:
+                continue
+            out[stage_id] = {
+                "label": clean_optional(str(stage.get("label") or stage.get("displayOrder") or "")) or stage_id,
+                "pipeline_id": pipeline_id or "",
+                "pipeline_label": clean_optional(str(pipeline.get("label") or "")) or pipeline_id or "",
+            }
+
+    # Fallback for restricted list endpoints: resolve stages from commonly used pipeline IDs.
+    if not out:
+        for pipeline_id in ["default", "sales_pipeline", "pipeline", "0"]:
+            payload, error = await fetch_external_json(
+                client=client,
+                method="GET",
+                path=f"https://api.hubapi.com/crm/v3/pipelines/deals/{pipeline_id}",
+                headers=headers,
+                params={"archived": "false"},
+            )
+            if error or not isinstance(payload, Mapping):
+                continue
+            stages = payload.get("stages")
+            if not isinstance(stages, list):
+                continue
+            pipeline_label = clean_optional(str(payload.get("label") or "")) or pipeline_id
+            for stage in stages:
+                if not isinstance(stage, Mapping):
+                    continue
+                stage_id = clean_optional(str(stage.get("id") or ""))
+                if not stage_id:
+                    continue
+                out[stage_id] = {
+                    "label": clean_optional(str(stage.get("label") or "")) or stage_id,
+                    "pipeline_id": pipeline_id,
+                    "pipeline_label": pipeline_label,
+                }
+            if out:
+                break
+    return out
+
+
+def enrich_hubspot_records_with_owner(
+    records: list[dict[str, Any]], owners: Mapping[str, Mapping[str, str]]
+) -> None:
+    if not records or not owners:
+        return
+    for record in records:
+        props = mapping_value(record, "properties")
+        if not isinstance(props, dict):
+            continue
+        owner_id = clean_optional(
+            str(props.get("hubspot_owner_id") or props.get("hs_owner_id") or props.get("owner_id") or "")
+        )
+        if not owner_id:
+            continue
+        owner_info = owners.get(owner_id)
+        if not isinstance(owner_info, Mapping):
+            continue
+        owner_name = clean_optional(str(owner_info.get("name") or ""))
+        owner_email = clean_optional(str(owner_info.get("email") or ""))
+        if owner_name:
+            props["hubspot_owner_name"] = owner_name
+        if owner_email:
+            props["hubspot_owner_email"] = owner_email
+
+
+def enrich_deals_with_stage_labels(
+    deals: list[dict[str, Any]], stage_map: Mapping[str, Mapping[str, str]]
+) -> None:
+    if not deals:
+        return
+    for deal in deals:
+        props = mapping_value(deal, "properties")
+        if not isinstance(props, dict):
+            continue
+        stage_id = clean_optional(str(props.get("dealstage") or ""))
+        info = stage_map.get(stage_id) if stage_id else None
+        label = clean_optional(str(info.get("label") or "")) if isinstance(info, Mapping) else None
+        pipeline_label = (
+            clean_optional(str(info.get("pipeline_label") or "")) if isinstance(info, Mapping) else None
+        )
+        if not label:
+            is_closed = normalize_text(str(props.get("hs_is_closed") or "")) in {"true", "1", "yes"}
+            is_won = normalize_text(str(props.get("hs_is_closed_won") or "")) in {"true", "1", "yes"}
+            if is_closed and is_won:
+                label = "Closed Won"
+            elif is_closed:
+                label = "Closed Lost"
+            elif stage_id:
+                label = f"Open ({stage_id})"
+            else:
+                label = "Open"
+        if label:
+            props["dealstage_label"] = label
+        if pipeline_label:
+            props["pipeline_label"] = pipeline_label
+
+
+def build_owner_map_from_payload(payload: Mapping[str, Any] | None) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(payload, Mapping):
+        return out
+    candidates: list[Any] = []
+    for key in ("owners", "users", "results", "items", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+    if not candidates and isinstance(payload.get("results"), Mapping):
+        nested = payload.get("results")
+        if isinstance(nested, Mapping):
+            for key in ("owners", "users", "items"):
+                value = nested.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+    if not candidates and any(k in payload for k in ("id", "ownerId", "userId")):
+        candidates = [payload]
+
+    for item in candidates:
+        if not isinstance(item, Mapping):
+            continue
+        owner_id = clean_optional(
+            str(item.get("id") or item.get("ownerId") or item.get("owner_id") or item.get("userId") or "")
+        )
+        if not owner_id:
+            continue
+        first = clean_optional(str(item.get("firstName") or item.get("first_name") or ""))
+        last = clean_optional(str(item.get("lastName") or item.get("last_name") or ""))
+        full_name = compact_spaces(
+            " ".join(
+                part
+                for part in [
+                    first,
+                    last,
+                    clean_optional(str(item.get("name") or "")),
+                    clean_optional(str(item.get("fullName") or "")),
+                ]
+                if part
+            )
+        )
+        email = clean_optional(str(item.get("email") or item.get("userEmail") or ""))
+        out[owner_id] = {"name": full_name or "", "email": email or ""}
+    return out
+
+
+async def fetch_owner_map_via_mcp(
+    *,
+    client: httpx.AsyncClient,
+    headers: Mapping[str, str],
+    base_params: Mapping[str, Any],
+    owner_ids: set[str],
+) -> dict[str, dict[str, str]]:
+    if not owner_ids:
+        return {}
+    paths = ["/hubspot/owners", "/hubspot/users"]
+    merged: dict[str, dict[str, str]] = {}
+    for path in paths:
+        payload, error = await fetch_external_json(
+            client=client,
+            method="GET",
+            path=path,
+            headers=headers,
+            params=dict(base_params),
+        )
+        if error:
+            continue
+        parsed = build_owner_map_from_payload(payload)
+        merged.update(parsed)
+        if owner_ids.issubset(set(merged.keys())):
+            break
+    return merged
+
+
+async def fetch_hubspot_crm_object_search(
+    *,
+    client: httpx.AsyncClient,
+    access_token: str | None,
+    object_type: Literal["companies", "contacts", "deals"],
+    properties: list[str],
+    query_text: str | None,
+    filter_groups: list[dict[str, Any]] | None = None,
+    max_items: int = 50,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if not clean_env_secret_single_line(access_token):
+        return [], "direct_crm_search: missing access token"
+
+    endpoint = f"https://api.hubapi.com/crm/v3/objects/{object_type}/search"
+    headers = hubspot_crm_headers(access_token)
+    page_size = max(1, min(100, max_items))
+    max_pages_raw = clean_optional(os.getenv("HUBSPOT_DIRECT_SEARCH_MAX_PAGES"))
+    try:
+        max_pages = max(1, min(10, int(max_pages_raw or "4")))
+    except ValueError:
+        max_pages = 4
+
+    out: list[dict[str, Any]] = []
+    after: str | None = None
+    pages = 0
+
+    while pages < max_pages and len(out) < max_items:
+        body: dict[str, Any] = {"limit": page_size, "properties": properties}
+        if query_text:
+            body["query"] = query_text
+        if filter_groups:
+            body["filterGroups"] = filter_groups
+        if after:
+            body["after"] = after
+        payload, error = await fetch_external_json(
+            client=client,
+            method="POST",
+            path=endpoint,
+            headers=headers,
+            json_body=body,
+        )
+        if error:
+            return out, error
+        page_results = extract_hubspot_results(payload)
+        append_unique_hubspot_records(out, page_results)
+        after = extract_hubspot_after(payload)
+        pages += 1
+        if not after or not page_results:
+            break
+
+    return out[:max_items], None
+
+
+async def fetch_hubspot_context_bundle_direct(
+    *,
+    client: httpx.AsyncClient,
+    access_token: str | None,
+    query_text: str | None,
+    org_name: str | None,
+    org_domain: str | None,
+    max_items: int,
+) -> dict[str, Any]:
+    company_properties = [
+        "name",
+        "domain",
+        "industry",
+        "city",
+        "state",
+        "country",
+        "hubspot_owner_id",
+        "hs_lead_status",
+        "lifecyclestage",
+        "lastmodifieddate",
+    ]
+    contact_properties = [
+        "firstname",
+        "lastname",
+        "email",
+        "phone",
+        "company",
+        "jobtitle",
+        "hubspot_owner_id",
+        "hs_lead_status",
+        "lastmodifieddate",
+    ]
+    deal_properties = [
+        "dealname",
+        "amount",
+        "dealstage",
+        "pipeline",
+        "closedate",
+        "createdate",
+        "hs_lastmodifieddate",
+        "hs_next_step",
+        "hs_next_activity_date",
+        "hs_last_activity_date",
+        "hs_is_closed",
+        "hs_is_closed_won",
+        "hubspot_owner_id",
+        "closed_lost_reason",
+        "associatedcompanyid",
+        "associated_company_id",
+        "hs_object_id",
+    ]
+
+    companies: list[dict[str, Any]] = []
+    contacts: list[dict[str, Any]] = []
+    deals: list[dict[str, Any]] = []
+    company_errors: list[str] = []
+    contact_errors: list[str] = []
+    deal_errors: list[str] = []
+
+    if org_domain:
+        domain_companies, domain_error = await fetch_hubspot_crm_object_search(
+            client=client,
+            access_token=access_token,
+            object_type="companies",
+            properties=company_properties,
+            query_text=None,
+            filter_groups=[
+                {"filters": [{"propertyName": "domain", "operator": "EQ", "value": org_domain}]}
+            ],
+            max_items=max_items,
+        )
+        append_unique_hubspot_records(companies, domain_companies)
+        if domain_error:
+            company_errors.append(domain_error)
+
+    company_query = query_text or org_name
+    if company_query:
+        name_companies, name_error = await fetch_hubspot_crm_object_search(
+            client=client,
+            access_token=access_token,
+            object_type="companies",
+            properties=company_properties,
+            query_text=company_query,
+            max_items=max_items,
+        )
+        append_unique_hubspot_records(companies, name_companies)
+        if name_error:
+            company_errors.append(name_error)
+
+    contact_query = query_text or org_name or org_domain
+    if contact_query:
+        contact_results, contact_error = await fetch_hubspot_crm_object_search(
+            client=client,
+            access_token=access_token,
+            object_type="contacts",
+            properties=contact_properties,
+            query_text=contact_query,
+            max_items=max_items,
+        )
+        append_unique_hubspot_records(contacts, contact_results)
+        if contact_error:
+            contact_errors.append(contact_error)
+
+    deal_query = query_text or org_name or org_domain
+    if deal_query:
+        deal_results, deal_error = await fetch_hubspot_crm_object_search(
+            client=client,
+            access_token=access_token,
+            object_type="deals",
+            properties=deal_properties,
+            query_text=deal_query,
+            max_items=max_items,
+        )
+        append_unique_hubspot_records(deals, deal_results)
+        if deal_error:
+            deal_errors.append(deal_error)
+
+    owner_ids = (
+        collect_owner_ids_from_hubspot_records(companies)
+        .union(collect_owner_ids_from_hubspot_records(contacts))
+        .union(collect_owner_ids_from_hubspot_records(deals))
+    )
+    owner_map = await fetch_hubspot_owner_map(client=client, access_token=access_token, owner_ids=owner_ids)
+    stage_map = await fetch_deal_stage_map(client=client, access_token=access_token)
+    enrich_hubspot_records_with_owner(companies, owner_map)
+    enrich_hubspot_records_with_owner(contacts, owner_map)
+    enrich_hubspot_records_with_owner(deals, owner_map)
+    enrich_deals_with_stage_labels(deals, stage_map)
+
+    combined_errors = company_errors + contact_errors + deal_errors
+    search_data = {
+        "source": "hubspot_crm_direct",
+        "query": query_text,
+        "results": {"companies": companies, "contacts": contacts, "deals": deals},
+    }
+    return {
+        "search_data": search_data,
+        "companies_data": {"companies": companies, "count": len(companies)},
+        "contacts_data": {"contacts": contacts, "count": len(contacts)},
+        "deals_data": {"deals": deals, "count": len(deals)},
+        "search_error": "; ".join(combined_errors) if combined_errors else None,
+        "companies_error": "; ".join(company_errors) if company_errors else None,
+        "contacts_error": "; ".join(contact_errors) if contact_errors else None,
+        "deals_error": "; ".join(deal_errors) if deal_errors else None,
+    }
 async def fetch_hubspot_context_bundle(
     *,
     client: httpx.AsyncClient,
@@ -2756,6 +4283,8 @@ async def fetch_hubspot_context_bundle(
     token_id: str | None,
     access_token: str | None,
     query_text: str | None,
+    org_name: str | None,
+    org_domain: str | None,
     max_items: int,
 ) -> dict[str, Any]:
     base_params = build_hubspot_base_params(install_id, token_id, access_token)
@@ -2769,30 +4298,57 @@ async def fetch_hubspot_context_bundle(
 
     search_data: dict[str, Any] | None = None
     search_error: str | None = None
-    if query_text:
-        search_data, search_error = await fetch_external_json(
-            client=client,
-            method="GET",
-            path="/hubspot/search",
-            headers=headers,
-            params={
-                **base_params,
-                "q": query_text,
-                "query": query_text,
-                "search": query_text,
-                "term": query_text,
-                "limit": max_items,
-            },
-        )
-
     companies_data: dict[str, Any] | None = None
     companies_error: str | None = None
     contacts_data: dict[str, Any] | None = None
     contacts_error: str | None = None
     deals_data: dict[str, Any] | None = None
     deals_error: str | None = None
+    retrieval_source = "hubspot_mcp"
 
-    if hubspot_section_accessible(summary_data, "companies"):
+    direct_enabled = hubspot_direct_search_enabled()
+    direct_bundle: dict[str, Any] | None = None
+    if direct_enabled and clean_env_secret_single_line(access_token):
+        direct_bundle = await fetch_hubspot_context_bundle_direct(
+            client=client,
+            access_token=access_token,
+            query_text=query_text,
+            org_name=org_name,
+            org_domain=org_domain,
+            max_items=max_items,
+        )
+        search_data = direct_bundle.get("search_data") if isinstance(direct_bundle.get("search_data"), Mapping) else None
+        search_error = clean_optional(str(direct_bundle.get("search_error") or ""))
+        companies_data = direct_bundle.get("companies_data") if isinstance(direct_bundle.get("companies_data"), Mapping) else None
+        companies_error = clean_optional(str(direct_bundle.get("companies_error") or ""))
+        contacts_data = direct_bundle.get("contacts_data") if isinstance(direct_bundle.get("contacts_data"), Mapping) else None
+        contacts_error = clean_optional(str(direct_bundle.get("contacts_error") or ""))
+        deals_data = direct_bundle.get("deals_data") if isinstance(direct_bundle.get("deals_data"), Mapping) else None
+        deals_error = clean_optional(str(direct_bundle.get("deals_error") or ""))
+        retrieval_source = "hubspot_crm_direct"
+
+    need_mcp_fallback = (
+        not direct_bundle
+        or (not companies_data and not contacts_data and not deals_data)
+        or bool(search_error and companies_error and contacts_error and deals_error)
+    )
+    if need_mcp_fallback:
+        if query_text:
+            search_data, search_error = await fetch_external_json(
+                client=client,
+                method="GET",
+                path="/hubspot/search",
+                headers=headers,
+                params={
+                    **base_params,
+                    "q": query_text,
+                    "query": query_text,
+                    "search": query_text,
+                    "term": query_text,
+                    "limit": max_items,
+                },
+            )
+
         company_params = {**base_params, "limit": max_items}
         if query_text:
             company_params.update(
@@ -2810,10 +4366,7 @@ async def fetch_hubspot_context_bundle(
             headers=headers,
             params=company_params,
         )
-    else:
-        companies_error = "/hubspot/companies: skipped (HubSpot summary reports companies inaccessible)"
 
-    if hubspot_section_accessible(summary_data, "contacts"):
         contact_params = {**base_params, "limit": max_items}
         if query_text:
             contact_params.update(
@@ -2831,10 +4384,7 @@ async def fetch_hubspot_context_bundle(
             headers=headers,
             params=contact_params,
         )
-    else:
-        contacts_error = "/hubspot/contacts: skipped (HubSpot summary reports contacts inaccessible)"
 
-    if hubspot_section_accessible(summary_data, "deals"):
         deal_params = {**base_params, "limit": max_items}
         if query_text:
             deal_params.update(
@@ -2852,12 +4402,39 @@ async def fetch_hubspot_context_bundle(
             headers=headers,
             params=deal_params,
         )
-    else:
-        deals_error = "/hubspot/deals: skipped (HubSpot summary reports deals inaccessible)"
+        retrieval_source = "hubspot_mcp" if not direct_bundle else "hubspot_crm_direct+mcp_fallback"
+
+    # Owner-name enrichment fallback through MCP when direct owner APIs do not return names.
+    companies_list = [dict(item) for item in mapping_list(companies_data, "companies")]
+    contacts_list = [dict(item) for item in mapping_list(contacts_data, "contacts")]
+    deals_list = [dict(item) for item in mapping_list(deals_data, "deals")]
+    owner_ids = (
+        collect_owner_ids_from_hubspot_records(companies_list)
+        .union(collect_owner_ids_from_hubspot_records(contacts_list))
+        .union(collect_owner_ids_from_hubspot_records(deals_list))
+    )
+    if owner_ids:
+        owner_map_mcp = await fetch_owner_map_via_mcp(
+            client=client,
+            headers=headers,
+            base_params=base_params,
+            owner_ids=owner_ids,
+        )
+        if owner_map_mcp:
+            enrich_hubspot_records_with_owner(companies_list, owner_map_mcp)
+            enrich_hubspot_records_with_owner(contacts_list, owner_map_mcp)
+            enrich_hubspot_records_with_owner(deals_list, owner_map_mcp)
+            if isinstance(companies_data, dict):
+                companies_data["companies"] = companies_list
+            if isinstance(contacts_data, dict):
+                contacts_data["contacts"] = contacts_list
+            if isinstance(deals_data, dict):
+                deals_data["deals"] = deals_list
 
     errors = [summary_error, search_error, companies_error, contacts_error, deals_error]
     auth_error = any(hubspot_error_is_auth(message) for message in errors if message)
     return {
+        "retrieval_source": retrieval_source,
         "summary_data": summary_data,
         "search_data": search_data,
         "companies_data": companies_data,
@@ -2870,7 +4447,6 @@ async def fetch_hubspot_context_bundle(
         "deals_error": deals_error,
         "auth_error": auth_error,
     }
-
 
 async def fetch_external_json(
     client: httpx.AsyncClient,
@@ -3079,7 +4655,7 @@ async def discover_domain_via_apollo_search(
     for candidate_query in organization_name_variants(query):
         try:
             response = await client.post(
-                "/api/v1/mixed_companies/search",
+                "/api/v1/organizations/search",
                 headers=headers,
                 params={
                     "q_organization_name": candidate_query,
@@ -3534,25 +5110,43 @@ def extract_domain_from_apollo_org(item: Mapping[str, Any]) -> str | None:
 
 def pick_best_apollo_org_match(
     organizations: list[Any], org_name: str | None, org_domain: str | None
-) -> Mapping[str, Any] | None:
+) -> tuple[Mapping[str, Any] | None, int, list[str]]:
     best_score = -1
+    best_reasons: list[str] = []
     best: Mapping[str, Any] | None = None
+    query_tokens = token_set(org_name)
     for org in organizations:
         if not isinstance(org, Mapping):
             continue
         score = 0
+        reasons: list[str] = []
         domain = extract_domain_from_apollo_org(org)
         name = clean_optional(str(org.get("name") or org.get("organization_name") or ""))
         if org_domain and domain and domain == org_domain:
-            score += 10
-        if org_name and text_contains(name, org_name):
-            score += 5
+            score += 12
+            reasons.append("domain_exact")
+        if org_domain and domain and domain.startswith(org_domain):
+            score += 2
+            reasons.append("domain_prefix")
+        if org_name and name and normalize_text(name) == normalize_text(org_name):
+            score += 8
+            reasons.append("name_exact")
+        elif org_name and text_contains(name, org_name):
+            score += 4
+            reasons.append("name_contains")
+        name_tokens = token_set(name)
+        overlap = len(query_tokens.intersection(name_tokens))
+        if overlap:
+            score += min(4, overlap)
+            reasons.append(f"token_overlap:{overlap}")
         if org_domain and domain and org_domain in domain:
-            score += 3
+            score += 1
+            reasons.append("domain_contains")
         if score > best_score:
             best_score = score
+            best_reasons = reasons
             best = org
-    return best
+    return best, max(0, best_score), best_reasons
 
 
 def first_non_empty(mapping: Mapping[str, Any], keys: list[str]) -> str | None:
@@ -3578,6 +5172,7 @@ def build_apollo_snapshot(
     if not isinstance(tech_stack, list):
         tech_stack = []
     technologies = [clean_optional(str(item)) for item in tech_stack if clean_optional(str(item))]
+    technologies = rank_tech_stack_for_ae(technologies)
     return {
         "apollo_org_id": clean_optional(str(source.get("id") or basic.get("id") or "")),
         "name": source_name or basic_name,
@@ -3593,11 +5188,138 @@ def build_apollo_snapshot(
             ],
         ),
         "annual_revenue": first_non_empty(source, ["annual_revenue", "estimated_annual_revenue"]),
+        "city": city,
+        "state": state,
+        "country": country,
         "hq_location": ", ".join(hq_parts) if hq_parts else None,
         "tech_stack": technologies[:12],
         "linkedin_url": first_non_empty(source, ["linkedin_url"]),
         "website_url": first_non_empty(source, ["website_url", "website"]),
     }
+
+
+def tech_priority_score(name: str) -> int:
+    text = normalize_text(name)
+    if not text:
+        return 0
+    token_scores = {
+        # 1) ITSM/ESM platform signal (highest relevance)
+        "servicenow": 200,
+        "jira service management": 188,
+        "jira service desk": 186,
+        "bmc helix": 184,
+        "bmc remedy": 182,
+        "remedy": 180,
+        "ivanti": 176,
+        "cherwell": 174,
+        "freshservice": 172,
+        "manageengine": 170,
+        "service desk": 166,
+        "itsm": 164,
+        # 2) ITOM/observability/CMDB feeder stack
+        "splunk": 160,
+        "datadog": 158,
+        "dynatrace": 156,
+        "new relic": 154,
+        "solarwinds": 152,
+        "logicmonitor": 150,
+        "appdynamics": 148,
+        "grafana": 146,
+        "prometheus": 144,
+        "scom": 142,
+        # 3) Security + identity stack
+        "okta": 140,
+        "entra": 138,
+        "azure ad": 138,
+        "active directory": 136,
+        "sailpoint": 134,
+        "cyberark": 132,
+        "crowdstrike": 130,
+        "defender": 128,
+        "mimecast": 127,
+        "sophos": 126,
+        # 4) Cloud + infra estate
+        "amazon aws": 126,
+        "aws": 126,
+        "azure": 124,
+        "google cloud": 122,
+        "gcp": 122,
+        "vmware": 120,
+        "kubernetes": 118,
+        "openshift": 116,
+        # 5) DevOps chain
+        "github": 114,
+        "gitlab": 112,
+        "azure devops": 110,
+        "jenkins": 108,
+        "terraform": 106,
+        "ansible": 104,
+        # 6) Systems of record/integration anchors
+        "salesforce": 102,
+        "sap": 100,
+        "oracle": 100,
+        "workday": 98,
+        "microsoft dynamics": 96,
+        "hubspot": 94,
+        # 7) endpoint/collab/email (supporting)
+        "microsoft office 365": 90,
+        "office 365": 90,
+        "outlook": 88,
+        "microsoft teams": 86,
+        "slack": 84,
+        "intune": 82,
+        "sccm": 80,
+    }
+    for token, score in token_scores.items():
+        if token in text:
+            return score
+
+    if any(token in text for token in ["cmdb", "incident", "change management", "asset management"]):
+        return 92
+    if any(token in text for token in ["iam", "siem", "soc", "xdr", "edr", "mdm"]):
+        return 89
+    if any(token in text for token in ["crm", "erp", "hris", "data warehouse", "analytics"]):
+        return 74
+    if any(
+        token in text
+        for token in [
+            "doubleclick",
+            "remarketing",
+            "google tag manager",
+            "facebook widget",
+            "facebook login",
+            "linkedin widget",
+            "linkedin login",
+            "linkedin marketing",
+            "adform",
+            "vimeo",
+            "mobile friendly",
+            "bootstrap",
+            "cdn",
+            "dns",
+            "remote",
+        ]
+    ):
+        return 18
+    if any(token in text for token in ["dns", "cdn", "tag manager", "adform", "bootstrap"]):
+        return 28
+    return 50
+
+
+def rank_tech_stack_for_ae(technologies: list[str | None]) -> list[str]:
+    seen: set[str] = set()
+    rows: list[tuple[int, str, str]] = []
+    for raw in technologies:
+        name = clean_optional(str(raw or ""))
+        if not name:
+            continue
+        key = normalize_text(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append((tech_priority_score(name), key, name))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return [name for _, _, name in rows]
 
 
 def split_name(full_name: str) -> tuple[str, str]:
@@ -3687,12 +5409,12 @@ async def generate_recipient_strategy(
     if payload.prospects:
         return prospects_to_recipients(payload, prospect_briefs)
 
-    role_discovery_max = min(payload.constraints.max_recipients, 2)
+    role_discovery_max = payload.constraints.max_recipients
     system_prompt = (
         "You build B2G/B2SLED sales targeting strategy. Return JSON only. "
         "Create recipient targets for consulting implementation outreach. "
         "You must avoid inventing named individuals. If no named prospects are provided, output role titles only. "
-        "Select only the top 2 roles most likely to drive implementation decisions."
+        "Select up to max_recipients roles most likely to drive implementation decisions."
     )
     user_prompt = {
         "task": "Create top recipient personas for outreach",
@@ -3792,6 +5514,7 @@ async def generate_email_campaign(
         "recipients": [recipient.model_dump() for recipient in recipients],
         "prospect_briefs": [brief.model_dump(mode="json") for brief in prospect_briefs],
         "prospects_supplied": bool(payload.prospects),
+        "sparse_project_signal_inputs": has_sparse_project_signal_inputs(payload),
         "provided_prospects": [p.model_dump(mode="json") for p in payload.prospects],
         "rules": [
             "Do not repeat campaign title or summary content.",
@@ -3812,7 +5535,7 @@ async def generate_email_campaign(
             "When prospects are supplied, avoid role definitions as copy (for example: 'the CIO oversees...'). Focus on implementation outcomes and why the named person is relevant now.",
             "When prospects are supplied, each recipient sequence must include that recipient name and title in Email 1 or Email 2.",
             "Each recipient sequence should reference at least one concrete project-specific fact from project_research or source-backed prospect signals.",
-            "When prospects are NOT supplied, keep recipients to the top 2 roles and write project-specific messaging without defining what the role does in general terms.",
+            "When prospects are NOT supplied, keep recipients to at most max_recipients roles and write project-specific messaging without defining what the role does in general terms.",
             "strategy_summary must read like an internal management brief: what we are pitching, why now, who owns decision/execution, and expected implementation outcomes.",
             "Keep strategy_summary concise and executive-ready for PDF sharing internally.",
             "Use 1 concise CRI credibility proof point in each email from cri_credibility_ammo.",
@@ -3832,6 +5555,8 @@ async def generate_email_campaign(
             "Do not include speculative execution claims such as hiring plans, resource allocation, personnel onboarding, or partnership development unless explicitly source-backed.",
             "Every email must anchor at least one sentence in a concrete project fact or recipient signal from provided inputs.",
             "Keep each email body concise and under 90 words.",
+            "When sparse_project_signal_inputs is true, treat initiative text as shorthand context. Do not assert recipient or organization ownership of that initiative.",
+            "When sparse_project_signal_inputs is true, use conditional language like 'If <initiative> is a current priority' instead of 'your <initiative>'.",
         ],
         "email_framework": {
             "email_1": [
@@ -4326,6 +6051,117 @@ def should_skip_project_web_search(payload: GrantCampaignGenerateRequest) -> boo
     return has_description and good_evidence >= 2
 
 
+
+
+def sparse_project_signal_text(value: str | None) -> bool:
+    text = compact_spaces(value or "")
+    if not text:
+        return False
+    tokens = [t for t in re.split(r"[^a-z0-9]+", normalize_text(text)) if t]
+    if len(tokens) <= 3:
+        return True
+
+    generic_nouns = {
+        "implementation",
+        "rollout",
+        "deployment",
+        "migration",
+        "upgrade",
+        "integration",
+        "initiative",
+        "program",
+        "project",
+        "transformation",
+    }
+    platform_tokens = {
+        "servicenow",
+        "salesforce",
+        "workday",
+        "oracle",
+        "sap",
+        "dynamics",
+        "microsoft",
+        "aws",
+        "azure",
+    }
+    if len(tokens) <= 7 and any(t in platform_tokens for t in tokens) and any(
+        t in generic_nouns for t in tokens
+    ):
+        # Example: "ServiceNow implementation" -> too sparse for ownership claims.
+        return True
+
+    if len(set(tokens)) <= 4:
+        return True
+    return False
+
+
+def has_sparse_project_signal_inputs(payload: GrantCampaignGenerateRequest) -> bool:
+    candidates: list[str] = []
+    if payload.award.description:
+        candidates.append(payload.award.description)
+    for item in payload.evidence:
+        if item.excerpt:
+            candidates.append(item.excerpt)
+    non_empty = [compact_spaces(value) for value in candidates if clean_optional(value)]
+    if not non_empty:
+        return False
+    meaningful = [value for value in non_empty if not sparse_project_signal_text(value)]
+    return len(meaningful) == 0
+
+
+def soften_sparse_signal_ownership_claims(body: str) -> str:
+    out = body
+    ownership_pattern = re.compile(
+        r"(?<!if\s)\byour\s+((?:[A-Za-z0-9&/,'?\-]+\s+){0,4}(?:implementation|rollout|deployment|migration|upgrade|integration|initiative|program|project))\b",
+        re.IGNORECASE,
+    )
+    blocked_context_tokens = {"mandate", "leadership", "oversight", "responsibility", "responsible"}
+
+    def ownership_repl(match: re.Match[str]) -> str:
+        phrase = compact_spaces(match.group(1))
+        phrase_tokens = set(re.split(r"[^a-z0-9]+", normalize_text(phrase)))
+        if phrase_tokens.intersection(blocked_context_tokens):
+            return match.group(0)
+        if not phrase:
+            return match.group(0)
+        return f"if {phrase} is a current priority"
+
+    out = ownership_pattern.sub(ownership_repl, out)
+    return normalize_copy_artifacts(out)
+
+
+def apply_sparse_signal_guardrails_to_campaign(
+    campaign: GrantCampaign, payload: GrantCampaignGenerateRequest
+) -> GrantCampaign:
+    if not has_sparse_project_signal_inputs(payload):
+        return campaign
+
+    patched_sequences: list[ProspectCampaign] = []
+    for seq in campaign.prospect_campaigns:
+        patched_emails: list[GrantEmail] = []
+        for email in seq.emails:
+            patched_emails.append(
+                GrantEmail(
+                    email_number=email.email_number,
+                    subject=email.subject,
+                    body=soften_sparse_signal_ownership_claims(email.body),
+                )
+            )
+        patched_sequences.append(
+            ProspectCampaign(
+                recipient_label=seq.recipient_label,
+                recipient_persona=seq.recipient_persona,
+                recipient_rationale=seq.recipient_rationale,
+                emails=patched_emails,
+            )
+        )
+
+    return GrantCampaign(
+        campaign_title=campaign.campaign_title,
+        strategy_summary=campaign.strategy_summary,
+        recipients=campaign.recipients,
+        prospect_campaigns=patched_sequences,
+    )
 def should_skip_prospect_web_search(payload: GrantCampaignGenerateRequest) -> bool:
     if not payload.prospects:
         return True
@@ -4397,6 +6233,8 @@ def enforce_source_bound_campaign(
 def source_bound_body(body: str, allowed_facts: list[str], allowed_generic: set[str]) -> str:
     lines = body.splitlines()
     out_lines: list[str] = []
+    stripped_content_count = 0
+    unsupported_count = 0
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -4411,10 +6249,13 @@ def source_bound_body(body: str, allowed_facts: list[str], allowed_generic: set[
             continue
         if is_sentence_supported_by_facts(stripped, allowed_facts):
             out_lines.append(line)
+            stripped_content_count += 1
             continue
-        # Replace unsupported claims with a safe, source-neutral line.
-        out_lines.append("We can review implementation scope, controls, and rollout sequencing in a working session.")
-    return normalize_copy_artifacts("\n".join(out_lines))
+        unsupported_count += 1
+    cleaned = dedupe_lines("\n".join(out_lines))
+    if stripped_content_count == 0 and unsupported_count > 0:
+        cleaned = f"{cleaned}\n\nCould we schedule a working session to review implementation scope and rollout sequencing?".strip()
+    return normalize_copy_artifacts(cleaned)
 
 
 def is_sentence_supported_by_facts(sentence: str, facts: list[str]) -> bool:
@@ -4490,15 +6331,22 @@ def ensure_named_prospect_copy(
 
 def dedupe_lines(text: str) -> str:
     out: list[str] = []
-    prev = ""
+    seen_nonempty: set[str] = set()
+    prev_blank = False
     for raw_line in text.splitlines():
         line = compact_spaces(raw_line)
-        if not line and not prev:
+        if not line:
+            if prev_blank:
+                continue
+            out.append("")
+            prev_blank = True
             continue
-        if line and line.lower() == prev.lower():
+        prev_blank = False
+        key = normalize_text(line)
+        if key in seen_nonempty:
             continue
+        seen_nonempty.add(key)
         out.append(line)
-        prev = line
     return "\n".join(out).strip()
 
 
@@ -4583,23 +6431,7 @@ def sanitize_email_block(emails: list[GrantEmail], recipient_label: str) -> list
                 body=format_email_body_for_delivery(dedupe_lines(email.body), recipient_label),
             )
         )
-
-    expected = [1, 2, 3, 4]
-    if [e.email_number for e in cleaned] != expected:
-        for missing in expected:
-            if missing not in {e.email_number for e in cleaned}:
-                cleaned.append(
-                    GrantEmail(
-                        email_number=missing,
-                        subject=f"Follow-up {missing}",
-                        body=format_email_body_for_delivery(
-                            "Following up on implementation planning for this initiative.",
-                            recipient_label,
-                        ),
-                    )
-                )
-        cleaned = sorted(cleaned, key=lambda e: e.email_number)[:4]
-    return cleaned
+    return sorted(cleaned, key=lambda e: e.email_number)[:4]
 
 
 def format_email_body_for_delivery(body: str, recipient_label: str) -> str:
@@ -4632,6 +6464,7 @@ def format_email_body_for_delivery(body: str, recipient_label: str) -> str:
     text = replace_weak_opening_phrases(text)
     text = enforce_direct_opening_line(text)
     text = normalize_copy_artifacts(text)
+    text = dedupe_lines(text)
 
     has_signature_token = "{{accountSignature}}" in text
     has_signoff = any(token in text.lower() for token in ["\nbest,", "\nregards,", "\nthank you,"])
@@ -4779,6 +6612,143 @@ def email_mentions_recipient(body: str, recipient_label: str) -> bool:
     full_name = extract_name_from_label(recipient_label).lower()
     first_name = extract_first_name_from_label(recipient_label).lower()
     return full_name in lower or (first_name and first_name in lower)
+
+
+def split_email_sentences(text: str) -> list[str]:
+    chunks = re.split(r"(?<=[.!?])\s+|\n+", text)
+    out: list[str] = []
+    for chunk in chunks:
+        line = compact_spaces(chunk)
+        if not line:
+            continue
+        out.append(line)
+    return out
+
+
+def email_quality_issues(body: str, sibling_bodies: list[str]) -> list[str]:
+    issues: list[str] = []
+    cleaned_lines = [
+        normalize_text(line)
+        for line in body.splitlines()
+        if line.strip() and "{{accountsignature}}" not in normalize_text(line)
+    ]
+    if cleaned_lines:
+        duplicate_ratio = 1 - (len(set(cleaned_lines)) / len(cleaned_lines))
+        if duplicate_ratio > 0.2:
+            issues.append("duplicate_lines")
+
+    body_sentences = [normalize_text(s) for s in split_email_sentences(body)]
+    if len(set(body_sentences)) < 3:
+        issues.append("low_unique_sentence_count")
+
+    body_tokens = content_tokens(body)
+    for sibling in sibling_bodies:
+        sibling_tokens = content_tokens(sibling)
+        overlap = jaccard_similarity(body_tokens, sibling_tokens)
+        if overlap >= 0.72:
+            issues.append("too_similar_to_other_email")
+            break
+    return issues
+
+
+async def regenerate_single_email(
+    *,
+    payload: GrantCampaignGenerateRequest,
+    recipient: GrantRecipient,
+    existing_sequence: list[GrantEmail],
+    target_email_number: int,
+    project_research: ProjectResearchBrief,
+    api_key: str,
+    model: str,
+    request_id: str,
+    cost_tracker: dict[str, Any],
+) -> GrantEmail:
+    sequence_context = [
+        {
+            "email_number": email.email_number,
+            "subject": email.subject,
+            "body": email.body,
+            "target": email.email_number == target_email_number,
+        }
+        for email in sorted(existing_sequence, key=lambda row: row.email_number)
+    ]
+    sibling_bodies = [
+        email.body
+        for email in existing_sequence
+        if email.email_number != target_email_number
+    ]
+    system_prompt = (
+        "You are an enterprise AE writing one campaign email in a 4-email sequence. "
+        "Return JSON only. Preserve sequence flow and avoid repeating ideas already used in sibling emails."
+    )
+    base_payload = {
+        "task": "Regenerate exactly one email in an existing 4-email sequence.",
+        "target_email_number": target_email_number,
+        "recipient": recipient.model_dump(),
+        "organization": payload.organization.model_dump(),
+        "award": payload.award.model_dump(mode="json"),
+        "project_research": project_research.model_dump(mode="json"),
+        "evidence": [item.model_dump(mode="json") for item in payload.evidence],
+        "existing_sequence_context": sequence_context,
+        "rules": [
+            "Do not rewrite sibling emails.",
+            "Generate only target_email_number subject and body.",
+            "Avoid repeated sentence structure from sibling emails.",
+            "Anchor at least one sentence in concrete provided evidence or project_research.",
+            "Max 90 words in body.",
+            "Use CTA language as working session or scope review meeting.",
+            "No em dash.",
+            "No motivational filler.",
+            "If sparse_project_signal_inputs is true, do not assert ownership phrases like 'your implementation'. Use conditional phrasing.",
+        ],
+        "required_output_schema": {
+            "subject": "string",
+            "body": "string",
+        },
+    }
+
+    attempt_payloads = [
+        base_payload,
+        {
+            **base_payload,
+            "rules": base_payload["rules"]
+            + [
+                "Use sentence structures that are materially different from sibling emails.",
+                "Do not repeat any full sentence from sibling emails.",
+            ],
+        },
+    ]
+    last_issues: list[str] = []
+    for idx, prompt_payload in enumerate(attempt_payloads, start=1):
+        content = await openai_json_completion(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_payload=prompt_payload,
+            temperature=0.25 if idx == 1 else 0.2,
+            stage=f"regenerate_email_{target_email_number}_attempt_{idx}",
+            request_id=request_id,
+            cost_tracker=cost_tracker,
+        )
+        subject = compact_spaces(clean_optional(str(content.get("subject") or "")) or "")
+        body = clean_optional(str(content.get("body") or ""))
+        if not subject or not body:
+            last_issues = ["missing_subject_or_body"]
+            continue
+        formatted_body = format_email_body_for_delivery(dedupe_lines(body), recipient.label)
+        issues = email_quality_issues(formatted_body, sibling_bodies)
+        if issues:
+            last_issues = issues
+            continue
+        return GrantEmail(
+            email_number=target_email_number,
+            subject=subject,
+            body=formatted_body,
+        )
+    raise RuntimeError(
+        "Regenerated email failed quality checks."
+        + (f" issues={','.join(last_issues)}" if last_issues else "")
+    )
 
 
 async def openai_json_completion(
@@ -5260,3 +7230,13 @@ def summarize_cost_tracker(cost_tracker: dict[str, Any]) -> dict[str, Any]:
         },
         "stages": cost_tracker.get("stages", []),
     }
+
+
+
+
+
+
+
+
+
+

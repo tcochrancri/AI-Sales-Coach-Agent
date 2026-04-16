@@ -779,6 +779,73 @@ body {
   font-weight: 700;
 }
 
+.account-match-layout {
+  border: 1px solid #d7e0ef;
+  border-radius: 10px;
+  background: #f8fbff;
+  padding: 10px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.account-match-primary {
+  display: grid;
+  gap: 4px;
+}
+
+.account-match-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #5a6e92;
+}
+
+.account-match-name {
+  margin: 0;
+  font-size: 21px;
+  line-height: 1.25;
+  font-weight: 700;
+  color: #1c2f4f;
+}
+
+.account-match-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 14px;
+}
+
+.account-match-item {
+  display: grid;
+  gap: 4px;
+}
+
+.account-match-item-label {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #2a3f63;
+}
+
+.account-match-inline-link {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #c7d3e8;
+  border-radius: 8px;
+  background: #fff;
+  color: #1f4e8c;
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 10px;
+}
+
+.account-match-inline-link:hover {
+  background: #ecf3ff;
+  border-color: #9fb6db;
+}
 .account-snapshot-section {
   justify-items: center;
 }
@@ -868,27 +935,27 @@ body {
 .apollo-snapshot-tech-list {
   margin: 2px 0 0;
   padding-left: 0;
-  list-style: disc;
+  list-style: none;
   color: #213a63;
   display: grid;
-  /* Content-width columns + center the whole grid (avoid 1fr stretching to edges) */
-  grid-template-columns: repeat(2, minmax(0, max-content));
-  gap: 6px 42px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 10px;
   width: 100%;
-  max-width: 900px;
-  justify-content: center;
-  justify-items: start;
+  max-width: 1000px;
+  justify-content: stretch;
+  justify-items: stretch;
   margin-inline: auto;
 }
 
 .apollo-snapshot-tech-list li {
-  display: list-item;
-  font-size: 16px;
-  line-height: 1.35;
-  margin-left: 18px;
-  padding: 1px 0;
-  text-align: left;
-  width: auto;
+  font-size: 14px;
+  line-height: 1.3;
+  padding: 8px 10px;
+  text-align: center;
+  width: 100%;
+  border: 1px solid #d9e1f2;
+  border-radius: 8px;
+  background: #fff;
 }
 
 .apollo-domain-link {
@@ -916,10 +983,9 @@ body {
 
 @media (max-width: 860px) {
   .apollo-snapshot-tech-list {
-    grid-template-columns: minmax(0, max-content);
-    justify-content: center;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     max-width: 100%;
-    gap: 8px;
+    gap: 8px 8px;
   }
 }
 
@@ -1150,3 +1216,4 @@ body {
     opacity: 1;
   }
 }
+

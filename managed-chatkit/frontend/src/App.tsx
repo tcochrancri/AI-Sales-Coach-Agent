@@ -4,6 +4,21 @@ import { GrantCampaignTool } from "./components/GrantCampaignTool";
 
 export default function App() {
   const [tool, setTool] = useState<"chat" | "grant">("chat");
+  const clearGrantSession = () => {
+    try {
+      window.localStorage.removeItem("grant_campaign_tool_form_v1");
+      window.localStorage.removeItem("grant_campaign_tool_result_v1");
+      window.localStorage.removeItem("grant_campaign_tool_modal_open_v1");
+    } catch {
+      // no-op
+    }
+  };
+  const switchTool = (next: "chat" | "grant") => {
+    if (tool === "grant" && next !== "grant") {
+      clearGrantSession();
+    }
+    setTool(next);
+  };
 
   return (
     <main className="app-shell">
@@ -17,14 +32,14 @@ export default function App() {
             <p className="sidebar-group-label">Research Workspaces</p>
             <button
               className={`sidebar-link ${tool === "chat" ? "active" : ""}`}
-              onClick={() => setTool("chat")}
+              onClick={() => switchTool("chat")}
               type="button"
             >
               Sales Coach Chat
             </button>
             <button
               className={`sidebar-link ${tool === "grant" ? "active" : ""}`}
-              onClick={() => setTool("grant")}
+              onClick={() => switchTool("grant")}
               type="button"
             >
               SLED Campaign Tool
@@ -54,14 +69,14 @@ export default function App() {
         <div className="actions-row">
           <button
             className={`sidebar-link ${tool === "chat" ? "active" : ""}`}
-            onClick={() => setTool("chat")}
+            onClick={() => switchTool("chat")}
             type="button"
           >
             Sales Coach Chat
           </button>
           <button
             className={`sidebar-link ${tool === "grant" ? "active" : ""}`}
-            onClick={() => setTool("grant")}
+            onClick={() => switchTool("grant")}
             type="button"
           >
             SLED Campaign Tool

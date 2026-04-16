@@ -26,9 +26,6 @@ type GrantCampaignResponse = {
     }>;
   };
   campaign_text: string;
-  debug_cost_estimate?: unknown;
-  debug_prospect_briefs?: unknown;
-  debug_project_research?: unknown;
 };
 
 type ApolloRecipientResult = {
@@ -61,6 +58,7 @@ type ApolloHealthResponse = {
 type HubspotContextResponse = {
   organization_name?: string | null;
   organization_domain?: string | null;
+  retrieval_source?: string | null;
   summary?: Record<string, unknown> | null;
   search?: Record<string, unknown> | null;
   companies?: Record<string, unknown> | null;
@@ -68,6 +66,7 @@ type HubspotContextResponse = {
   deals?: Record<string, unknown> | null;
   exact_matches?: Record<string, unknown> | null;
   account_match?: Record<string, unknown> | null;
+  recommended_action?: Record<string, unknown> | null;
   relationship_history?: Record<string, unknown> | null;
   similar_closed_won?: Record<string, unknown> | null;
   errors?: string[];
@@ -78,6 +77,21 @@ type ApolloAccountSnapshotResponse = {
   message?: string;
   organization?: Record<string, unknown> | null;
   lookup?: Record<string, unknown> | null;
+};
+
+type CampaignFormContext = {
+  organizationName: string;
+  organizationWebsite: string;
+  awardId: string;
+  agency: string;
+  awardDescription: string;
+};
+
+type RegenerateEmailResponse = {
+  recipient_label?: string;
+  email?: { email_number: number; subject: string; body: string };
+  sequence?: Array<{ email_number: number; subject: string; body: string }>;
+  error?: string;
 };
 
 type RecommendedAssetItem = {
@@ -200,7 +214,7 @@ export function GrantCampaignTool() {
   const [awardId, setAwardId] = useState("");
   const [agency, setAgency] = useState("");
   const [awardDescription, setAwardDescription] = useState("");
-  const [maxRecipients, setMaxRecipients] = useState("8");
+  const [maxRecipients, setMaxRecipients] = useState("2");
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -220,7 +234,7 @@ export function GrantCampaignTool() {
         setAwardId(parsed.awardId ?? "");
         setAgency(parsed.agency ?? "");
         setAwardDescription(parsed.awardDescription ?? "");
-        setMaxRecipients(parsed.maxRecipients ?? "8");
+        setMaxRecipients(parsed.maxRecipients ?? "2");
       }
       const rawResult = window.localStorage.getItem(RESULT_STORAGE_KEY);
       if (rawResult) {
@@ -299,7 +313,31 @@ export function GrantCampaignTool() {
     return () => window.clearInterval(timer);
   }, [loading]);
 
-  const closeModal = () => setIsModalOpen(false);
+  const resetFormState = () => {
+    setOrganizationName("");
+    setOrganizationWebsite("");
+    setOrganizationCity("");
+    setOrganizationState("");
+    setAwardId("");
+    setAgency("");
+    setAwardDescription("");
+    setMaxRecipients("2");
+    setError(null);
+    setResult(null);
+    setVisibleSteps(0);
+    try {
+      window.localStorage.removeItem(FORM_STORAGE_KEY);
+      window.localStorage.removeItem(RESULT_STORAGE_KEY);
+      window.localStorage.removeItem(MODAL_STORAGE_KEY);
+    } catch {
+      // no-op
+    }
+  };
+
+  const closeModal = () => {
+    setIsModalOpen(false);
+    resetFormState();
+  };
   const expectedLocalPort = "3001";
 
   const submitPayload = async (payload: unknown) => {
@@ -309,7 +347,6 @@ export function GrantCampaignTool() {
     setIsModalOpen(true);
     try {
       const endpoint = apiUrl("/api/grant-campaign/generate");
-      console.info("[sled-tool] submitting campaign payload", { endpoint, payload });
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -326,11 +363,6 @@ export function GrantCampaignTool() {
       } catch {
         json = {} as typeof json;
       }
-      console.info("[sled-tool] response received", {
-        status: response.status,
-        ok: response.ok,
-        bodyPreview: rawBody.slice(0, 300),
-      });
       if (!response.ok) {
         throw new Error(
           json.error ??
@@ -396,7 +428,7 @@ export function GrantCampaignTool() {
       },
       evidence,
       constraints: {
-        max_recipients: Number(maxRecipients || 8),
+        max_recipients: Math.max(1, Math.min(5, Number(maxRecipients || 2))),
         version: 1,
       },
     };
@@ -411,8 +443,7 @@ export function GrantCampaignTool() {
         fields are marked with *.
       </p>
 
-      <form className="stack-sm" onSubmit={handleSubmit}>
-        <div className="toolbar">
+      <form className="stack-sm" onSubmit={handleSubmit}>        <div className="toolbar">
           <Field
             label="Organization Name *"
             value={organizationName}
@@ -433,18 +464,20 @@ export function GrantCampaignTool() {
             value={maxRecipients}
             onChange={setMaxRecipients}
             type="number"
+            min={1}
+            max={5}
           />
         </div>
 
         <TextAreaField
-          label="Award Description *"
+          label="Award Description / Account Notes *"
           value={awardDescription}
           onChange={setAwardDescription}
           rows={4}
           required
         />
 
-        <div className="actions-row">
+        <div className="actions-row"> 
           <button className="action-btn" type="submit" disabled={loading}>
             {loading ? "Generating..." : "Generate Campaign"}
           </button>
@@ -459,6 +492,14 @@ export function GrantCampaignTool() {
         result={result}
         error={error}
         visibleSteps={visibleSteps}
+        formContext={{
+          organizationName,
+          organizationWebsite,
+          awardId,
+          agency,
+          awardDescription,
+        }}
+        onResultUpdate={setResult}
         onClose={closeModal}
       />
     </div>
@@ -471,6 +512,8 @@ type ModalProps = {
   result: GrantCampaignResponse | null;
   error: string | null;
   visibleSteps: number;
+  formContext: CampaignFormContext;
+  onResultUpdate: (next: GrantCampaignResponse | null) => void;
   onClose: () => void;
 };
 
@@ -480,6 +523,8 @@ function CampaignResultModal({
   result,
   error,
   visibleSteps,
+  formContext,
+  onResultUpdate,
   onClose,
 }: ModalProps) {
   type WorkspaceTab = "overview" | "hubspot" | "email" | "phone";
@@ -491,6 +536,8 @@ function CampaignResultModal({
   const [apolloEmailLoadingLabel, setApolloEmailLoadingLabel] = useState<string | null>(null);
   const [apolloPhoneLoadingLabel, setApolloPhoneLoadingLabel] = useState<string | null>(null);
   const [apolloError, setApolloError] = useState<string | null>(null);
+  const [emailRegenerateError, setEmailRegenerateError] = useState<string | null>(null);
+  const [regeneratingEmailKey, setRegeneratingEmailKey] = useState<string | null>(null);
   const [apolloByLabel, setApolloByLabel] = useState<Record<string, ApolloRecipientResult>>({});
   const [apolloAvailable, setApolloAvailable] = useState<boolean>(false);
   const [apolloHealthMessage, setApolloHealthMessage] = useState<string | null>(null);
@@ -509,6 +556,8 @@ function CampaignResultModal({
   const apolloPopupRef = useRef<Window | null>(null);
   const hubspotPopupRef = useRef<Window | null>(null);
   const modalBodyRef = useRef<HTMLDivElement | null>(null);
+  const activeWorkspaceRunKeyRef = useRef<string | null>(null);
+  const workspaceRequestSeqRef = useRef(0);
 
   const closePopupRef = (popupRef: MutableRefObject<Window | null>) => {
     const popup = popupRef.current;
@@ -574,11 +623,25 @@ function CampaignResultModal({
   }, [isOpen, result]);
 
   useEffect(() => {
-    if (!isOpen || !result) return;
-    if (hubspotContext) return;
+    if (!isOpen || !result) {
+      activeWorkspaceRunKeyRef.current = null;
+      return;
+    }
+    const runKey = result.lead_id || result.generated_at || result.campaign.campaign_title;
+    if (activeWorkspaceRunKeyRef.current === runKey && hubspotContext) {
+      return;
+    }
+    activeWorkspaceRunKeyRef.current = runKey;
+    workspaceRequestSeqRef.current += 1;
+    setHubspotContext(null);
+    setApolloSnapshot(null);
+    setCaseStudies(null);
+    setHubspotError(null);
+    setCaseStudyError(null);
+    setApolloError(null);
     void loadWorkspaceData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, result]);
+  }, [isOpen, result?.lead_id, result?.generated_at]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -622,6 +685,89 @@ function CampaignResultModal({
     window.setTimeout(() => {
       setCopiedEmailKey((prev) => (prev === key ? null : prev));
     }, 1400);
+  };
+
+  const regenerateEmail = async (
+    sequence: {
+      recipient_label: string;
+      recipient_persona: string;
+      recipient_rationale: string;
+      emails: Array<{ email_number: number; subject: string; body: string }>;
+    },
+    emailNumber: number
+  ) => {
+    if (!result) return;
+    const key = `${sequence.recipient_label}-${emailNumber}`;
+    setRegeneratingEmailKey(key);
+    setEmailRegenerateError(null);
+    try {
+      const response = await fetch(apiUrl("/api/grant-campaign/regenerate-email"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          lead_id: result.lead_id,
+          organization: {
+            name: formContext.organizationName || result.minimum_fields_used?.organization_name || null,
+            website:
+              formContext.organizationWebsite || result.minimum_fields_used?.organization_website || null,
+            city: null,
+            state: null,
+          },
+          award: {
+            source: "usaspending",
+            award_id: formContext.awardId || result.minimum_fields_used?.award_id || null,
+            generated_internal_id: null,
+            agency: formContext.agency || null,
+            amount: null,
+            award_date: null,
+            period_start: null,
+            period_end: null,
+            cfda_number: null,
+            cfda_title: null,
+            description: formContext.awardDescription || null,
+            place_of_performance: null,
+          },
+          evidence: buildEvidence(
+            cleanNullable(formContext.awardId || result.minimum_fields_used?.award_id || null),
+            cleanNullable(formContext.awardDescription || null)
+          ),
+          recipient_label: sequence.recipient_label,
+          recipient_persona: sequence.recipient_persona,
+          recipient_rationale: sequence.recipient_rationale,
+          target_email_number: emailNumber,
+          existing_sequence: sequence.emails,
+        }),
+      });
+      const body = (await response.json()) as RegenerateEmailResponse;
+      if (!response.ok) {
+        throw new Error(body.error ?? `Regenerate failed (${response.status})`);
+      }
+      const nextSequence = Array.isArray(body.sequence)
+        ? body.sequence
+        : sequence.emails.map((email) =>
+            email.email_number === emailNumber && body.email ? body.email : email
+          );
+      const updatedCampaign = result.campaign.prospect_campaigns.map((row) => {
+        if (row.recipient_label !== sequence.recipient_label) return row;
+        return {
+          ...row,
+          emails: nextSequence,
+        };
+      });
+      onResultUpdate({
+        ...result,
+        campaign: {
+          ...result.campaign,
+          prospect_campaigns: updatedCampaign,
+        },
+      });
+    } catch (regenerateError) {
+      setEmailRegenerateError(
+        regenerateError instanceof Error ? regenerateError.message : "Email regeneration failed."
+      );
+    } finally {
+      setRegeneratingEmailKey((prev) => (prev === key ? null : prev));
+    }
   };
 
   const exportPdf = async () => {
@@ -698,7 +844,9 @@ function CampaignResultModal({
   };
 
   const openWebsiteWorkspaceLink = (url: string) => {
-    openSideBySideWorkspace(normalizeWorkspaceUrl(url), "website_workspace", hubspotPopupRef, "Organization Website");
+    const normalized = normalizeWorkspaceUrl(url);
+    const proxied = apiUrl(`/api/web/embed?url=${encodeURIComponent(normalized)}`);
+    openSideBySideWorkspace(proxied, "website_workspace", hubspotPopupRef, "Organization Website");
   };
 
   const enrichRecipientEmailWithApollo = async (recipient: {
@@ -813,9 +961,14 @@ function CampaignResultModal({
 
   const loadWorkspaceData = async () => {
     if (!result) return;
+    const requestSeq = ++workspaceRequestSeqRef.current;
+    const isStale = () => requestSeq !== workspaceRequestSeqRef.current;
     setHubspotLoading(true);
     setHubspotError(null);
     setCaseStudyError(null);
+    setHubspotContext(null);
+    setCaseStudies(null);
+    setApolloSnapshot(null);
     try {
       const orgName = result.minimum_fields_used?.organization_name ?? null;
       const orgWebsite = result.minimum_fields_used?.organization_website ?? null;
@@ -830,6 +983,7 @@ function CampaignResultModal({
       const apolloBody = (await apolloSnapshotResp.json()) as ApolloAccountSnapshotResponse & {
         error?: string;
       };
+      if (isStale()) return;
       if (!apolloSnapshotResp.ok) {
         setApolloSnapshot({
           matched: false,
@@ -842,6 +996,8 @@ function CampaignResultModal({
       }
 
       const apolloIndustry = readStringFromRecord(apolloBody.organization, "industry") || null;
+      const apolloCity = readStringFromRecord(apolloBody.organization, "city") || null;
+      const apolloState = readStringFromRecord(apolloBody.organization, "state") || null;
       const hubspotResp = await fetch(apiUrl("/api/hubspot/context"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -849,8 +1005,14 @@ function CampaignResultModal({
           organization_name: orgName,
           organization_website: orgWebsite,
           organization_industry: apolloIndustry,
-          organization_city: null,
-          organization_state: null,
+          organization_city: apolloCity,
+          organization_state: apolloState,
+          project_signal_text: [
+            cleanNullable(formContext.awardId || result.minimum_fields_used?.award_id || null),
+            cleanNullable(formContext.awardDescription || null),
+          ]
+            .filter(Boolean)
+            .join(" | ") || null,
           max_items: 25,
           years_back: 5,
           closed_won_only: true,
@@ -860,6 +1022,7 @@ function CampaignResultModal({
         error?: string;
         details?: unknown;
       };
+      if (isStale()) return;
       if (!hubspotResp.ok) {
         const detailsText =
           Array.isArray(hubspotBody.details) && hubspotBody.details.length
@@ -886,6 +1049,7 @@ function CampaignResultModal({
         }),
       });
       const caseBody = (await caseResp.json()) as CaseStudyRecommendResponse & { error?: string };
+      if (isStale()) return;
       if (!caseResp.ok) {
         setCaseStudyError(caseBody.error ?? `Case study lookup failed (${caseResp.status})`);
       } else {
@@ -894,6 +1058,9 @@ function CampaignResultModal({
       }
       setActiveTab("overview");
     } catch (hubspotLoadError) {
+      if (isStale()) return;
+      setHubspotContext(null);
+      setCaseStudies(null);
       setHubspotError(
         hubspotLoadError instanceof Error
           ? hubspotLoadError.message
@@ -901,6 +1068,7 @@ function CampaignResultModal({
       );
       setActiveTab("overview");
     } finally {
+      if (isStale()) return;
       setHubspotLoading(false);
     }
   };
@@ -1061,6 +1229,7 @@ function CampaignResultModal({
                             context={hubspotContext}
                             snapshot={apolloSnapshot}
                             onOpenWorkspaceLink={openHubspotWorkspaceLink}
+                            onOpenWebsiteLink={openWebsiteWorkspaceLink}
                           />
                         ) : (
                           <p className="muted">Load account context to view CRM data.</p>
@@ -1125,6 +1294,7 @@ function CampaignResultModal({
                       </section>
                       <section className="campaign-section">
                         <h4>Personalized Email Sequences</h4>
+                        {emailRegenerateError ? <p className="status-error">{emailRegenerateError}</p> : null}
                         <div className="email-list">
                           {result.campaign.prospect_campaigns.map((sequence) => (
                             <article
@@ -1163,6 +1333,22 @@ function CampaignResultModal({
                                       `${sequence.recipient_label}-${email.email_number}`
                                         ? "Copied"
                                         : "Copy Email"}
+                                    </button>
+                                    <button
+                                      className="action-btn-secondary"
+                                      type="button"
+                                      onClick={() => {
+                                        void regenerateEmail(sequence, email.email_number);
+                                      }}
+                                      disabled={
+                                        regeneratingEmailKey ===
+                                        `${sequence.recipient_label}-${email.email_number}`
+                                      }
+                                    >
+                                      {regeneratingEmailKey ===
+                                      `${sequence.recipient_label}-${email.email_number}`
+                                        ? "Regenerating..."
+                                        : "Regenerate"}
                                     </button>
                                   </div>
                                 </div>
@@ -1293,23 +1479,28 @@ function HubspotDashboard({
   context,
   snapshot,
   onOpenWorkspaceLink,
+  onOpenWebsiteLink,
 }: {
   context: HubspotContextResponse;
   snapshot: ApolloAccountSnapshotResponse | null;
   onOpenWorkspaceLink: (url: string) => void;
+  onOpenWebsiteLink: (url: string) => void;
 }) {
-  const exact = getExactMatchCounts(context);
   const errors = Array.isArray(context.errors) ? context.errors : [];
   const accountInsight = buildAccountInsight(context);
-  const hasConfidentMatch = accountInsight.confidentMatch;
+  const recommendedAction = readRecommendedAction(context);
+  const hasConfidentMatch = accountInsight.confidentMatch && Boolean(accountInsight.suggestedCompanyName);
   const hasAnyMatch = accountInsight.matched;
+  const canConfirmAccount = accountInsight.confirmable && Boolean(accountInsight.suggestedCompanyName);
+  const companyDomainHref = accountInsight.suggestedCompanyDomain
+    ? "https://" + accountInsight.suggestedCompanyDomain
+    : "";
   const apolloIndustry = readStringFromRecord(snapshot?.organization ?? null, "industry");
   const trustedHubspotIndustry = getPrimaryIndustryFromHubspot(context);
   const industryTarget =
     apolloIndustry ||
     trustedHubspotIndustry ||
     "";
-  const industryClosedDeals = buildIndustryClosedDealBriefs(context, industryTarget);
   const dealBriefs = buildRelevantDealBriefs(context, industryTarget);
   const outreachBrief = buildOutreachBrief(context, dealBriefs);
 
@@ -1328,30 +1519,80 @@ function HubspotDashboard({
 
       {hasAnyMatch ? (
         <section className="hubspot-card">
-          <h5>Account Match Confidence</h5>
-          <p className="muted">
-            Companies: {exact.companies} | Contacts: {exact.contacts} | Deals: {exact.deals}
-          </p>
+          <h5>Account Match</h5>
           <p className={`hubspot-pill ${hasConfidentMatch ? "is-ok" : "is-warn"}`}>
-            {hasConfidentMatch ? "Confident CRM Match Found" : "Match Needs Confirmation"}
+            {hasConfidentMatch
+              ? "Matched"
+              : canConfirmAccount
+                ? "Needs Review"
+                : "No Confirmable Record"}
           </p>
-          <div className="hubspot-kv-grid">
-            <p>
-              <strong>Match Confidence:</strong> {accountInsight.confidence}
-            </p>
-            <p>
-              <strong>Primary Match Basis:</strong> {accountInsight.matchBasis}
-            </p>
-            <p>
-              <strong>Account Owner (HubSpot company record):</strong> {accountInsight.owner}
-            </p>
+
+          <div className="account-match-layout">
+            <div className="account-match-primary">
+              <p className="account-match-label">Company Name</p>
+              <p className="account-match-name">{accountInsight.suggestedCompanyName || "Not available"}</p>
+            </div>
+            <div className="account-match-meta">
+              <div className="account-match-item">
+                <p className="account-match-item-label">Website</p>
+                {companyDomainHref ? (
+                  <a
+                    href={companyDomainHref}
+                    className="account-match-inline-link"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      onOpenWebsiteLink(companyDomainHref);
+                    }}
+                  >
+                    {accountInsight.suggestedCompanyDomain}
+                  </a>
+                ) : (
+                  <p className="muted">Not available</p>
+                )}
+              </div>
+              <div className="account-match-item">
+                <p className="account-match-item-label">Record</p>
+                {canConfirmAccount && accountInsight.suggestedCompanyUrl ? (
+                  <a
+                    href={accountInsight.suggestedCompanyUrl}
+                    className="account-match-inline-link"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      onOpenWorkspaceLink(accountInsight.suggestedCompanyUrl);
+                    }}
+                  >
+                    Open Matched Company Record
+                  </a>
+                ) : (
+                  <p className="muted">Not available</p>
+                )}
+              </div>
+            </div>
           </div>
-          {!hasConfidentMatch ? (
+          {!hasConfidentMatch && !canConfirmAccount ? (
             <p className="muted">
-              A possible account match was found, but confidence is below the trusted threshold. Deal and outreach
-              guidance remains hidden until confidence is high.
+              HubSpot returned search signal but no concrete company record to open. Refresh CRM context after verifying name/domain.
             </p>
           ) : null}
+        </section>
+      ) : null}
+
+      {recommendedAction ? (
+        <section className="hubspot-card">
+          <h5>Recommended Action</h5>
+          <p className="hubspot-pill is-warn">{recommendedAction.label}</p>
+          <div className="hubspot-kv-grid">
+            <p>
+              <strong>Why:</strong> {recommendedAction.rationale}
+            </p>
+            <p>
+              <strong>Next Step:</strong> {recommendedAction.nextStep}
+            </p>
+            <p>
+              <strong>Do Not Do:</strong> {recommendedAction.doNotDo}
+            </p>
+          </div>
         </section>
       ) : null}
 
@@ -1370,9 +1611,9 @@ function HubspotDashboard({
       {hasConfidentMatch ? (
         <>
           <section className="hubspot-card">
-            <h5>Relevant Deals ({dealBriefs.length})</h5>
+            <h5>Account Deals ({dealBriefs.length})</h5>
             <p className="muted">
-              Showing up to 3 most recent deals prioritized by exact industry match:
+              Showing up to 5 most recent matched-account deals (open, closed-won, closed-lost):
               {industryTarget ? ` ${industryTarget}` : " account-related context"}.
             </p>
             {dealBriefs.length ? (
@@ -1382,7 +1623,7 @@ function HubspotDashboard({
                     <div>
                       <strong>{deal.name}</strong>
                       <p className="muted">
-                        {deal.stage} | Next: {deal.nextStepDate} | Last activity: {deal.lastActivityDate}
+                        {deal.stage} | Amount: {deal.amount} | Next: {deal.nextStepDate} | Last activity: {deal.lastActivityDate}
                       </p>
                     </div>
                     {deal.url ? (
@@ -1416,47 +1657,26 @@ function HubspotDashboard({
               </p>
               <p>
                 <strong>What To Reference:</strong> {outreachBrief.whatToReference}
+                {outreachBrief.referenceUrl ? (
+                  <>
+                    {" "}
+                    <a
+                      href={outreachBrief.referenceUrl}
+                      className="hubspot-link"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        onOpenWorkspaceLink(outreachBrief.referenceUrl as string);
+                      }}
+                    >
+                      Open ROM
+                    </a>
+                  </>
+                ) : null}
               </p>
             </div>
           </section>
         </>
       ) : null}
-
-      <section className="hubspot-card">
-        <h5>Industry-Matched Closed Deals ({industryClosedDeals.length})</h5>
-        <p className="muted">
-          Portfolio proof for {formatIndustryLabel(industryTarget) || "target industry"} (up to 3 most relevant
-          closed-won deals).
-        </p>
-        {industryClosedDeals.length ? (
-          <ul className="hubspot-list">
-            {industryClosedDeals.map((deal) => (
-              <li key={deal.id || `${deal.name}-${deal.stage}`} className="hubspot-list-item">
-                <div>
-                  <strong>{deal.name}</strong>
-                  <p className="muted">
-                    {deal.stage} | Closed: {deal.lastActivityDate} | Motion: {deal.motion}
-                  </p>
-                </div>
-                {deal.url ? (
-                  <a
-                    href={deal.url}
-                    className="hubspot-link"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      onOpenWorkspaceLink(deal.url);
-                    }}
-                  >
-                    Open
-                  </a>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">No closed-won portfolio deals found for this industry signal yet.</p>
-        )}
-      </section>
 
       {errors.length ? (
         <section className="hubspot-card">
@@ -1551,8 +1771,8 @@ function getHubspotDealRawList(context: HubspotContextResponse | null): HubspotD
       return {
         id: asString(row?.id),
         name: asString(props.dealname),
-        stage: asString(props.dealstage),
-        pipeline: asString(props.pipeline),
+        stage: asString(props.dealstage_label) || asString(props.dealstage),
+        pipeline: asString(props.pipeline_label) || asString(props.pipeline),
         amount: asString(props.amount),
         closeDate: asString(props.closedate),
         createdAt: asString(row?.createdAt) || asString(props.createdate) || asString(props.hs_createdate),
@@ -1596,6 +1816,23 @@ function formatShortDate(value: string): string {
   return parsed.toLocaleDateString();
 }
 
+function isHttpUrl(value: string): boolean {
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function extractFirstHttpUrl(value: string): string {
+  if (!value) return "";
+  const match = value.match(/https?:\/\/[^\s|)\]]+/i);
+  const candidate = match ? match[0] : "";
+  return isHttpUrl(candidate) ? candidate : "";
+}
+
 function daysSince(value: string): number | null {
   if (!value) return null;
   const parsed = new Date(value);
@@ -1608,39 +1845,88 @@ function daysSince(value: string): number | null {
 function buildAccountInsight(context: HubspotContextResponse | null): {
   matched: boolean;
   confidentMatch: boolean;
+  confirmable: boolean;
   confidence: string;
   matchBasis: string;
   owner: string;
+  ownerId: string;
+  suggestedCompanyName: string;
+  suggestedCompanyDomain: string;
+  suggestedCompanyUrl: string;
+  candidateCount: number;
 } {
   const accountMatch = readRecord(context?.account_match);
   const matched = Boolean(accountMatch?.matched);
-  const confidentMatch = Boolean(accountMatch?.confident_match);
-  const confidenceValue = Number(accountMatch?.confidence);
-  const selected = readRecord(accountMatch?.selected_company);
-  const owner = asString(selected?.owner) || "Unassigned";
   const method = asString(accountMatch?.method) || "none";
   const reason = asString(accountMatch?.reason) || "No usable account-level match";
-  if (matched) {
-    const confidenceLabel = Number.isFinite(confidenceValue)
-      ? `${Math.round(Math.max(0, Math.min(1, confidenceValue)) * 100)}%`
-      : "Matched";
-    return {
-      matched: true,
-      confidentMatch,
-      confidence: confidenceLabel,
-      matchBasis: `${method} | ${reason}`,
-      owner,
-    };
-  }
+  const confidenceValue = Number(accountMatch?.confidence);
+
+  const selected = readRecord(accountMatch?.selected_company);
+  const suggestedCompanyName =
+    asString(selected?.name) || asString(accountMatch?.selected_name) || asString(accountMatch?.company_name);
+  const suggestedCompanyDomain = normalizeDomain(
+    asString(selected?.domain) || asString(accountMatch?.selected_domain) || asString(accountMatch?.company_domain)
+  );
+  const suggestedCompanyUrl = asString(selected?.url) || asString(accountMatch?.selected_company_url);
+
+  const ownerId = asString(selected?.owner_id) || asString(selected?.hubspot_owner_id);
+  const ownerName = asString(selected?.owner_name) || asString(selected?.owner);
+  const owner = ownerName || (ownerId ? `Owner name unavailable (ID ${ownerId})` : "Unassigned");
+
+  const hasRealCompanyId = Boolean(asString(selected?.id));
+  const hasRealCompanyName = Boolean(suggestedCompanyName);
+  const companyType = normalizeText(asString(selected?.company_type));
+  const isSynthetic =
+    Boolean(selected?.synthetic) ||
+    companyType.includes("synthetic") ||
+    companyType.includes("domain_candidate") ||
+    companyType.includes("ghost");
+
+  const hasConfirmableFlag = Object.prototype.hasOwnProperty.call(accountMatch ?? {}, "confirmable");
+  const backendConfirmable = accountMatch?.confirmable === true;
+  const fallbackConfirmable = hasRealCompanyId && hasRealCompanyName && !isSynthetic && Boolean(suggestedCompanyUrl);
+  const confirmable = hasConfirmableFlag ? backendConfirmable : fallbackConfirmable;
+  const confidentMatch = accountMatch?.confident_match === true && confirmable;
+
+  const confidence = Number.isFinite(confidenceValue)
+    ? `${Math.round(Math.max(0, Math.min(1, confidenceValue)) * 100)}%`
+    : matched
+      ? "Matched"
+      : "None";
+
+  const exact = readRecord(context?.exact_matches);
+  const companies = exact && Array.isArray(exact.companies) ? (exact.companies as unknown[]) : [];
+  const candidateCount = companies.length;
+
   return {
-    matched: false,
-    confidentMatch: false,
-    confidence: "None",
-    matchBasis: "No usable account-level match",
-    owner: "Unassigned",
+    matched,
+    confidentMatch,
+    confirmable,
+    confidence,
+    matchBasis: `${method} | ${reason}`,
+    owner,
+    ownerId,
+    suggestedCompanyName,
+    suggestedCompanyDomain,
+    suggestedCompanyUrl,
+    candidateCount,
   };
 }
 
+function readRecommendedAction(
+  context: HubspotContextResponse | null
+): { label: string; rationale: string; nextStep: string; doNotDo: string } | null {
+  const action = readRecord(context?.recommended_action);
+  if (!action) return null;
+
+  const label = asString(action.label) || "Recommended Action";
+  const rationale = asString(action.rationale) || asString(action.why_now) || "No rationale provided";
+  const nextStep = asString(action.next_step) || asString(action.nextStep) || "No next step provided";
+  const doNotDo = asString(action.do_not_do) || asString(action.doNotDo) || "No guardrail provided";
+
+  if (!label && !rationale && !nextStep && !doNotDo) return null;
+  return { label, rationale, nextStep, doNotDo };
+}
 function buildActivePipelineInsight(context: HubspotContextResponse | null): {
   openCount: number;
   nextStepDate: string;
@@ -1824,70 +2110,213 @@ type DealBrief = {
   motion: string;
 };
 
+function getMatchedCompanyIdentity(context: HubspotContextResponse | null): {
+  id: string;
+  name: string;
+  domain: string;
+} | null {
+  const accountMatch = readRecord(context?.account_match);
+  const selected = readRecord(accountMatch?.selected_company);
+  const id = asString(selected?.id) || asString(accountMatch?.selected_company_id);
+  const name = normalizeText(
+    asString(selected?.name) || asString(accountMatch?.selected_name) || asString(accountMatch?.company_name)
+  );
+  const domain = normalizeDomain(
+    asString(selected?.domain) || asString(accountMatch?.selected_domain) || asString(accountMatch?.company_domain)
+  );
+  if (!id && !name && !domain) return null;
+  return { id, name, domain };
+}
+
+function dealMatchesMatchedCompany(
+  deal: HubspotDealRaw,
+  matchedCompany: { id: string; name: string; domain: string } | null
+): boolean {
+  if (!matchedCompany) return true;
+
+  const props = deal.properties;
+  const dealCompanyId = pickFirstValue(props, [
+    "hubspot_company_id",
+    "hs_company_id",
+    "associatedcompanyid",
+    "associated_company_id",
+    "company_id",
+  ]);
+  if (matchedCompany.id && dealCompanyId && normalizeText(dealCompanyId) === normalizeText(matchedCompany.id)) {
+    return true;
+  }
+
+  const dealCompanyDomain = normalizeDomain(
+    pickFirstValue(props, ["company_domain", "domain", "associated_company_domain"])
+  );
+  if (matchedCompany.domain && dealCompanyDomain && dealCompanyDomain === matchedCompany.domain) {
+    return true;
+  }
+
+  const dealCompanyName = normalizeText(
+    pickFirstValue(props, ["company", "associated_company", "associatedcompany", "account_name"])
+  );
+  if (
+    matchedCompany.name &&
+    dealCompanyName &&
+    (dealCompanyName.includes(matchedCompany.name) || matchedCompany.name.includes(dealCompanyName))
+  ) {
+    return true;
+  }
+
+  const dealName = normalizeText(deal.name);
+  if (matchedCompany.name && dealName && dealName.includes(matchedCompany.name)) {
+    return true;
+  }
+
+  return false;
+}
+
+
+function contactMatchesMatchedCompany(
+  contact: HubspotContactRaw,
+  matchedCompany: { id: string; name: string; domain: string } | null
+): boolean {
+  if (!matchedCompany) return true;
+
+  const props = contact.properties;
+  const contactCompanyId = pickFirstValue(props, [
+    "hubspot_company_id",
+    "hs_company_id",
+    "associatedcompanyid",
+    "associated_company_id",
+    "company_id",
+  ]);
+  if (matchedCompany.id && contactCompanyId && normalizeText(contactCompanyId) === normalizeText(matchedCompany.id)) {
+    return true;
+  }
+
+  const contactDomain = normalizeDomain(
+    pickFirstValue(props, ["company_domain", "domain", "email_domain", "associated_company_domain"])
+  );
+  if (matchedCompany.domain && contactDomain && contactDomain === matchedCompany.domain) {
+    return true;
+  }
+
+  const companyName = normalizeText(contact.company || pickFirstValue(props, ["company", "associated_company"]));
+  if (
+    matchedCompany.name &&
+    companyName &&
+    (companyName.includes(matchedCompany.name) || matchedCompany.name.includes(companyName))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function scoreContactForIcp(contact: HubspotContactRaw, dealBriefs: DealBrief[]): number {
+  const title = normalizeText(contact.title);
+  const topDeal = dealBriefs[0];
+  const dealSignalText = normalizeText(
+    `${topDeal?.name || ""} ${topDeal?.motion || ""} ${topDeal?.stage || ""}`
+  );
+  let score = 0;
+
+  if (/(chief|cfo|ceo|coo|cio|cto|president|owner)/.test(title)) score += 8;
+  if (/(svp|vice president|vp|director|head)/.test(title)) score += 6;
+  if (/(manager|lead|program)/.test(title)) score += 4;
+  if (/(specialist|analyst|coordinator)/.test(title)) score += 2;
+
+  if (/(finance|procurement|sourcing|contracts|acquisition)/.test(title)) score += 4;
+  if (/(it|technology|information|systems|digital|security|data)/.test(title)) score += 4;
+  if (/(operations|implementation|delivery|transformation)/.test(title)) score += 5;
+
+  if (dealSignalText.includes("closed lost") || dealSignalText.includes("lost")) {
+    if (/(operations|implementation|delivery|program|transformation)/.test(title)) score += 3;
+    if (/(finance|procurement|contracts|acquisition)/.test(title)) score += 2;
+  }
+
+  if (dealSignalText.includes("closed won") || dealSignalText.includes("won")) {
+    if (/(executive|chief|vp|director|head)/.test(title)) score += 2;
+  }
+
+  if (!contact.title) score -= 2;
+  return score;
+}
+
+function buildIcpRoleFallback(dealBriefs: DealBrief[]): string {
+  const topDeal = dealBriefs[0];
+  const signal = normalizeText(`${topDeal?.motion || ""} ${topDeal?.stage || ""} ${topDeal?.name || ""}`);
+  const roles = [
+    "Program Director (Implementation/Delivery)",
+    "VP/Director of Operations",
+    "Procurement or Contracts Lead",
+  ];
+
+  if (/(it|technology|systems|platform|service now|servicenow|digital)/.test(signal)) {
+    roles.unshift("CIO/CTO or IT Director");
+  }
+  if (/(finance|cost|budget)/.test(signal)) {
+    roles.unshift("CFO/Finance Director");
+  }
+
+  return roles.slice(0, 3).join(", ");
+}
 function buildRelevantDealBriefs(context: HubspotContextResponse | null, industryTarget: string): DealBrief[] {
   const deals = getHubspotDealRawList(context);
-  const similarWins = getSimilarWins(context);
+  const matchedCompany = getMatchedCompanyIdentity(context);
+  const scopedDeals = matchedCompany ? deals.filter((deal) => dealMatchesMatchedCompany(deal, matchedCompany)) : deals;
+
+  if (matchedCompany && !scopedDeals.length) {
+    return [];
+  }
+
   const industryTokens = normalizeText(industryTarget)
     .split(/[^a-z0-9]+/)
     .filter((token: string) => token.length >= 4);
 
-  const normalized = deals.map((deal) => {
-    const stageAgeDays = daysSince(
-      asString(deal.properties.hs_lastmodifieddate) || deal.updatedAt || deal.createdAt
-    );
-    const nextStepRaw = pickFirstValue(deal.properties, [
-      "hs_next_activity_date",
-      "hs_next_step_date",
-      "next_activity_date",
-    ]);
-    const lastActivityRaw = pickFirstValue(deal.properties, ["hs_last_activity_date", "lastactivitydate"]);
-    const dealText = normalizeText(`${deal.name} ${deal.pipeline} ${deal.stage}`);
-    const industryScore = industryTokens.length
-      ? industryTokens.filter((token: string) => dealText.includes(token)).length
-      : 0;
-    const recencyTs = new Date(deal.updatedAt || deal.createdAt || deal.closeDate || 0).getTime();
-    return {
-      id: deal.id,
-      name: deal.name || "Deal",
-      stage: deal.stage || "Stage unknown",
-      nextStepDate: nextStepRaw ? formatShortDate(nextStepRaw) : "Not set",
-      lastActivityDate: lastActivityRaw ? formatShortDate(lastActivityRaw) : "Not logged",
-      url: deal.url,
-      stageAgeDays,
-      amount: deal.amount ? `$${deal.amount}` : "No amount",
-      motion: deal.pipeline || pickFirstValue(deal.properties, ["dealtype", "motion_type"]) || "Unknown motion",
-      industryScore,
-      recencyTs: Number.isFinite(recencyTs) ? recencyTs : 0,
-      closedWonBoost: isClosedWonStage(deal.stage) ? 1 : 0,
-    };
-  });
+  return scopedDeals
+    .map((deal) => {
+      const stageAgeDays = daysSince(
+        asString(deal.properties.hs_lastmodifieddate) || deal.updatedAt || deal.createdAt
+      );
+      const nextStepRaw = pickFirstValue(deal.properties, [
+        "hs_next_activity_date",
+        "hs_next_step_date",
+        "next_activity_date",
+      ]);
+      const lastActivityRaw = pickFirstValue(deal.properties, ["hs_last_activity_date", "lastactivitydate"]);
+      const dealText = normalizeText(`${deal.name} ${deal.pipeline} ${deal.stage}`);
+      const industryScore = industryTokens.length
+        ? industryTokens.filter((token: string) => dealText.includes(token)).length
+        : 0;
+      const recencyTs = new Date(deal.updatedAt || deal.createdAt || deal.closeDate || 0).getTime();
+      const closedLostBoost = isClosedLostStage(deal.stage) ? 2 : 0;
+      const closedWonBoost = isClosedWonStage(deal.stage) ? 1 : 0;
 
-  const ranked = normalized
+      return {
+        id: deal.id,
+        name: deal.name || "Deal",
+        stage: deal.stage || "Stage unknown",
+        nextStepDate: nextStepRaw ? formatShortDate(nextStepRaw) : "Not set",
+        lastActivityDate: lastActivityRaw
+          ? formatShortDate(lastActivityRaw)
+          : formatShortDate(deal.updatedAt || deal.closeDate || "") || "Not logged",
+        url: deal.url,
+        stageAgeDays,
+        amount: deal.amount ? `$${deal.amount}` : "No amount",
+        motion: deal.pipeline || pickFirstValue(deal.properties, ["dealtype", "motion_type"]) || "Unknown motion",
+        industryScore,
+        recencyTs: Number.isFinite(recencyTs) ? recencyTs : 0,
+        closedLostBoost,
+        closedWonBoost,
+      };
+    })
     .sort((a, b) => {
       if (b.industryScore !== a.industryScore) return b.industryScore - a.industryScore;
+      if (b.closedLostBoost !== a.closedLostBoost) return b.closedLostBoost - a.closedLostBoost;
       if (b.closedWonBoost !== a.closedWonBoost) return b.closedWonBoost - a.closedWonBoost;
       return b.recencyTs - a.recencyTs;
     })
-    .slice(0, 3)
-    .map(({ industryScore: _industryScore, recencyTs: _recencyTs, closedWonBoost: _closedWonBoost, ...deal }) => deal);
-
-  if (ranked.length) return ranked;
-
-  return similarWins
-    .slice(0, 3)
-    .map((deal) => ({
-      id: deal.id,
-      name: deal.deal_name || "Closed Won Deal",
-      stage: deal.dealstage || "Closed Won",
-      nextStepDate: "N/A",
-      lastActivityDate: deal.close_date ? formatShortDate(deal.close_date) : "Not logged",
-      url: deal.url,
-      stageAgeDays: null,
-      amount: deal.amount ? `$${deal.amount}` : "No amount",
-      motion: asString(deal.dealstage) || "Closed Won",
-    }));
+    .slice(0, 5)
+    .map(({ industryScore: _industryScore, recencyTs: _recencyTs, closedLostBoost: _a, closedWonBoost: _b, ...deal }) => deal);
 }
-
 function buildOutreachBrief(
   context: HubspotContextResponse | null,
   dealBriefs: DealBrief[]
@@ -1895,6 +2324,7 @@ function buildOutreachBrief(
   whyNow: string;
   whoToMessage: string;
   whatToReference: string;
+  referenceUrl: string | null;
 } {
   const topDeal = dealBriefs[0];
   const reasons: string[] = [];
@@ -1949,11 +2379,24 @@ function buildOutreachBrief(
     : topDeal
       ? `${topDeal.motion} motion in ${topDeal.stage} for ${topDeal.name}`
       : "No initiative/pain/motion fields populated in current CRM payload";
+  const explicitReference = topDealRaw
+    ? pickFirstValue(topDealRaw.properties, [
+        "rom_url",
+        "rom_link",
+        "reference_url",
+        "recommendation_memo_url",
+        "rom",
+      ]) || topDealRaw.url
+    : topDeal?.url || "";
+  const explicitReferenceUrl = isHttpUrl(explicitReference) ? explicitReference : "";
+  const derivedReferenceUrl = extractFirstHttpUrl(whatToReference);
+  const referenceUrl = explicitReferenceUrl || derivedReferenceUrl || null;
 
   return {
     whyNow: reasons.join("; "),
     whoToMessage,
     whatToReference,
+    referenceUrl,
   };
 }
 
@@ -2281,7 +2724,7 @@ function PhoneCallPanel({
                 <strong>Opener (30 seconds)</strong>
               </p>
               <p>
-                Hi {name}, this is {callerPhrase}. Iâ€™m reaching out because teams in {industry}
+                Hi {name}, this is {callerPhrase}. I’m reaching out because teams in {industry}
                 are under pressure to execute complex initiatives without adding delivery risk.
                 We help organizations like {orgName} turn strategy into implementable operating plans
                 across governance, controls, and rollout sequencing.
@@ -2326,36 +2769,36 @@ function PhoneCallPanel({
 
 function normalizeRecommendedAssets(items: unknown): RecommendedAssetItem[] {
   const list = Array.isArray(items) ? items : [];
-  return list
-    .map((item, index) => {
-      const row = asRecord(item);
-      const title = readStringFromRecord(row, "title") || `Asset ${index + 1}`;
-      const url = readStringFromRecord(row, "url");
-      if (!url) return null;
-      const scoreRaw = row?.score;
-      return {
-        id: readStringFromRecord(row, "id") || undefined,
-        title,
-        url,
-        thumbnail_url:
-          readStringFromRecord(row, "thumbnail_url") ||
-          readStringFromRecord(row, "preview_url") ||
-          null,
-        thumbnail_base64:
-          readStringFromRecord(row, "thumbnail_base64") ||
-          readStringFromRecord(row, "preview_base64") ||
-          null,
-        industry: readStringFromRecord(row, "industry") || null,
-        score: typeof scoreRaw === "number" ? scoreRaw : null,
-        reason: readStringFromRecord(row, "reason") || null,
-        path: readStringFromRecord(row, "path") || null,
-        matched_terms: Array.isArray(row?.matched_terms)
-          ? row.matched_terms.map((term) => String(term))
-          : [],
-        source: readStringFromRecord(row, "source") || undefined,
-      } satisfies RecommendedAssetItem;
-    })
-    .filter((item): item is RecommendedAssetItem => Boolean(item));
+  const out: RecommendedAssetItem[] = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const row = asRecord(list[index]);
+    const title = readStringFromRecord(row, "title") || `Asset ${index + 1}`;
+    const url = readStringFromRecord(row, "url");
+    if (!url) continue;
+    const scoreRaw = row?.score;
+    out.push({
+      id: readStringFromRecord(row, "id") || undefined,
+      title,
+      url,
+      thumbnail_url:
+        readStringFromRecord(row, "thumbnail_url") ||
+        readStringFromRecord(row, "preview_url") ||
+        null,
+      thumbnail_base64:
+        readStringFromRecord(row, "thumbnail_base64") ||
+        readStringFromRecord(row, "preview_base64") ||
+        null,
+      industry: readStringFromRecord(row, "industry") || null,
+      score: typeof scoreRaw === "number" ? scoreRaw : null,
+      reason: readStringFromRecord(row, "reason") || null,
+      path: readStringFromRecord(row, "path") || null,
+      matched_terms: Array.isArray(row?.matched_terms)
+        ? row.matched_terms.map((term) => String(term))
+        : [],
+      source: readStringFromRecord(row, "source") || undefined,
+    });
+  }
+  return out;
 }
 
 function CaseStudiesPanel({
@@ -2539,10 +2982,8 @@ function buildLeadershipReportHtml(
     ? `
     <h2>HubSpot Activity</h2>
     <div class="card">
-      <p><strong>Status:</strong> ${escapeHtml(hubspotExport.status)}</p>
-      <p><strong>Match Confidence:</strong> ${escapeHtml(hubspotExport.matchConfidence)}</p>
-      <p><strong>Match Basis:</strong> ${escapeHtml(hubspotExport.matchBasis)}</p>
-      <p><strong>Account Owner:</strong> ${escapeHtml(hubspotExport.accountOwner)}</p>
+      <p><strong>Match State:</strong> ${escapeHtml(hubspotExport.matchConfidence)}</p>
+      <p><strong>Match Notes:</strong> ${escapeHtml(hubspotExport.matchBasis)}</p>
       <p><strong>Industry signal:</strong> ${escapeHtml(hubspotExport.industrySignal || "Not available")} <span class="muted">(${escapeHtml(hubspotExport.industrySignalSource)})</span></p>
       ${
         hubspotExport.deals.length
@@ -2712,10 +3153,8 @@ async function exportCampaignPdf(
   if (hubspotContext) {
     const hubspotExport = buildHubspotExportSummary(hubspotContext, apolloSnapshot);
     draw("HubSpot Activity", { size: 13, bold: true });
-    draw(`Status: ${hubspotExport.status}`, { size: 10, gap: 2 });
-    draw(`Match Confidence: ${hubspotExport.matchConfidence}`, { size: 10, gap: 2 });
-    draw(`Match Basis: ${hubspotExport.matchBasis}`, { size: 10, gap: 2 });
-    draw(`Account Owner: ${hubspotExport.accountOwner}`, { size: 10, gap: 2 });
+    draw(`Match State: ${hubspotExport.matchConfidence}`, { size: 10, gap: 2 });
+    draw(`Match Notes: ${hubspotExport.matchBasis}`, { size: 10, gap: 2 });
     draw(
       `Industry signal: ${hubspotExport.industrySignal || "Not available"} (${hubspotExport.industrySignalSource})`,
       { size: 10, gap: 6 }
@@ -2769,7 +3208,9 @@ async function exportCampaignPdf(
   }
 
   const bytes = await pdf.save();
-  const blob = new Blob([bytes], { type: "application/pdf" });
+  const blobBuffer = new ArrayBuffer(bytes.length);
+  new Uint8Array(blobBuffer).set(bytes);
+  const blob = new Blob([blobBuffer], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -2794,11 +3235,11 @@ function toSafeFilename(value: string): string {
 
 function escapeHtml(text: string): string {
   return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -3079,6 +3520,8 @@ type FieldProps = {
   onChange: (value: string) => void;
   type?: "text" | "number";
   required?: boolean;
+  min?: number;
+  max?: number;
 };
 
 function Field({
@@ -3087,6 +3530,8 @@ function Field({
   onChange,
   type = "text",
   required = false,
+  min,
+  max,
 }: FieldProps) {
   return (
     <label className="field">
@@ -3095,12 +3540,13 @@ function Field({
         type={type}
         value={value}
         required={required}
+        min={type === "number" ? min : undefined}
+        max={type === "number" ? max : undefined}
         onChange={(event) => onChange(event.target.value)}
       />
     </label>
   );
 }
-
 type TextAreaProps = {
   label: string;
   value: string;
@@ -3129,8 +3575,8 @@ function TextAreaField({
   );
 }
 
-function cleanNullable(value: string): string | null {
-  const trimmed = value.trim();
+function cleanNullable(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
   return trimmed ? trimmed : null;
 }
 
@@ -3153,3 +3599,40 @@ function buildEvidence(
     },
   ];
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
