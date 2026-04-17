@@ -1510,7 +1510,7 @@ function HubspotDashboard({
         <section className="hubspot-card">
           <div className="hubspot-empty-match">
             <span className="hubspot-empty-match-icon" aria-hidden="true">
-              âœ…
+              OK
             </span>
             <p className="hubspot-empty-match-text">No Company Match Found</p>
           </div>
@@ -2724,7 +2724,7 @@ function PhoneCallPanel({
                 <strong>Opener (30 seconds)</strong>
               </p>
               <p>
-                Hi {name}, this is {callerPhrase}. I’m reaching out because teams in {industry}
+                Hi {name}, this is {callerPhrase}. I'm reaching out because teams in {industry}
                 are under pressure to execute complex initiatives without adding delivery risk.
                 We help organizations like {orgName} turn strategy into implementable operating plans
                 across governance, controls, and rollout sequencing.
